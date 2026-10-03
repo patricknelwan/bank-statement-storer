@@ -4,6 +4,8 @@
   "version": "1.0.0",
   "engines": {"node": ">=24 <25"},
   "scripts": {
+    "dev": "docker compose --env-file .env -f deploy/compose.local.yml up -d --build --wait",
+    "down": "docker compose --env-file .env -f deploy/compose.local.yml down",
     "postman": "sh docs/postman/run.sh"
   },
   "devDependencies": {

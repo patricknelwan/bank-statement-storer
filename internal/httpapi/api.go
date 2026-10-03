@@ -374,7 +374,7 @@ func (a API) retry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := a.DB.Exec(r.Context(), `UPDATE bca_email_jobs j SET state='queued',attempts=0,next_attempt_at=now(),lease_until=NULL,reason_code=NULL,updated_at=now()
-		FROM gmail_integrations i WHERE j.integration_id=i.id AND j.id=$1 AND i.user_id=$2 AND i.status='connected' AND j.state IN ('failed','needs_review')`, id, auth.FromContext(r.Context()).UserID)
+		FROM gmail_integrations i WHERE j.integration_id=i.id AND j.id=$1 AND i.user_id=$2 AND i.status='connected' AND j.state IN ('failed','needs_review','unsupported')`, id, auth.FromContext(r.Context()).UserID)
 	if err != nil {
 		fail(w, r, 503, "unavailable")
 		return
@@ -398,6 +398,7 @@ type transactionDTO struct {
 	SourceAccountAlias       string    `json:"source_account_alias"`
 	BeneficiaryBank          string    `json:"beneficiary_bank"`
 	BeneficiaryAccountMasked string    `json:"beneficiary_account_masked"`
+	PaymentTo                string    `json:"payment_to,omitempty"`
 	Note                     string    `json:"note"`
 	Version                  int       `json:"version"`
 	CreatedAt                time.Time `json:"created_at"`
@@ -407,7 +408,7 @@ func scanTransaction(row pgx.Row) (transactionDTO, error) {
 	var t transactionDTO
 	var amount int64
 	var fee *int64
-	err := row.Scan(&t.ID, &t.BankReference, &t.ReceiptKind, &t.Classification, &t.OccurredAt, &amount, &fee, &t.Currency, &t.SourceAccountAlias, &t.BeneficiaryBank, &t.BeneficiaryAccountMasked, &t.Note, &t.Version, &t.CreatedAt)
+	err := row.Scan(&t.ID, &t.BankReference, &t.ReceiptKind, &t.Classification, &t.OccurredAt, &amount, &fee, &t.Currency, &t.SourceAccountAlias, &t.BeneficiaryBank, &t.BeneficiaryAccountMasked, &t.PaymentTo, &t.Note, &t.Version, &t.CreatedAt)
 	if err != nil {
 		return t, err
 	}
@@ -419,7 +420,7 @@ func scanTransaction(row pgx.Row) (transactionDTO, error) {
 	return t, nil
 }
 
-const transactionColumns = `t.id,t.bank_reference,t.receipt_kind,t.classification,t.occurred_at,t.amount_minor,t.fee_minor,t.currency,t.source_account_alias,coalesce(t.beneficiary_bank,''),t.beneficiary_account_masked,t.note,t.version,t.created_at`
+const transactionColumns = `t.id,t.bank_reference,t.receipt_kind,t.classification,t.occurred_at,t.amount_minor,t.fee_minor,t.currency,t.source_account_alias,coalesce(t.beneficiary_bank,''),t.beneficiary_account_masked,t.payment_to,t.note,t.version,t.created_at`
 
 func (a API) transactions(w http.ResponseWriter, r *http.Request) {
 	limit, c, err := page(r)

@@ -389,28 +389,31 @@ func (w *Worker) process(ctx context.Context, id, integrationID, messageID strin
 			w.outcome(ctx, id, "needs_review", "sender_changed")
 			return nil
 		}
-		body, verified, err := p.Full(ctx, messageID)
+		message, err := p.Full(ctx, messageID)
 		if err != nil {
 			return err
 		}
-		if !w.Config.TrustGmailAuthResults || !verified {
+		if !w.Config.TrustGmailAuthResults || !message.Verified {
 			w.outcome(ctx, id, "needs_review", "authentication_unverified")
 			return nil
 		}
-		receipt, outcome := bca.Parse(body)
+		receipt, outcome := bca.ParseWithSubject(message.Body, message.Subject)
 		if outcome != "" {
 			w.outcome(ctx, id, outcome, "parser_"+outcome)
 			return nil
 		}
-		h := hmac.New(sha256.New, []byte(w.Config.AccountHMACKey))
-		h.Write([]byte(strings.ToUpper(receipt.BeneficiaryBank) + "\x00" + receipt.BeneficiaryAccount))
-		event := transaction.Event{SourceJobID: id, SourceMessageID: messageID, Receipt: receipt, BeneficiaryMatchToken: hex.EncodeToString(h.Sum(nil))}
+		event := transaction.Event{SourceJobID: id, SourceMessageID: messageID, Receipt: receipt}
+		if receipt.BeneficiaryAccount != "" {
+			h := hmac.New(sha256.New, []byte(w.Config.AccountHMACKey))
+			h.Write([]byte(strings.ToUpper(receipt.BeneficiaryBank) + "\x00" + receipt.BeneficiaryAccount))
+			event.BeneficiaryMatchToken = hex.EncodeToString(h.Sum(nil))
+		}
 		event.BeneficiaryAccount = ""
 		payload, err = json.Marshal(event)
 		if err != nil {
 			return err
 		}
-		ciphertext, err := w.Auth.Encrypt(string(body), id)
+		ciphertext, err := w.Auth.Encrypt(string(message.Body), id)
 		if err != nil {
 			return err
 		}

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -87,6 +88,11 @@ func (s *Service) Decrypt(ciphertext []byte, context string) (string, error) {
 }
 
 func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
+	publicURL, _ := url.Parse(s.Config.PublicURL)
+	if !strings.EqualFold((&url.URL{Host: r.Host}).Hostname(), publicURL.Hostname()) {
+		http.Redirect(w, r, strings.TrimRight(s.Config.PublicURL, "/")+"/auth/google/start", http.StatusFound)
+		return
+	}
 	state, e1 := Random()
 	nonce, e2 := Random()
 	verifier := oauth2.GenerateVerifier()

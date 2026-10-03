@@ -31,6 +31,7 @@ type Receipt struct {
 	BeneficiaryBank          string  `json:"beneficiary_bank"`
 	BeneficiaryAccountMasked string  `json:"beneficiary_account_masked"`
 	BeneficiaryAccount       string  `json:"beneficiary_account,omitempty"`
+	PaymentTo                string  `json:"payment_to,omitempty"`
 	TransactionDateLocal     string  `json:"transaction_date_local"`
 	Timezone                 string  `json:"timezone"`
 }
@@ -118,7 +119,9 @@ func fieldsFromHTML(body []byte) (map[string]string, error) {
 }
 
 // Parse returns ignored, unsupported, or needs_review for emails that cannot be imported.
-func Parse(body []byte) (Receipt, string) {
+func Parse(body []byte) (Receipt, string) { return ParseWithSubject(body, "") }
+
+func ParseWithSubject(body []byte, subject string) (Receipt, string) {
 	f, err := fieldsFromHTML(body)
 	if err == nil && len(f) == 0 {
 		for _, line := range strings.Split(string(body), "\n") {
@@ -136,6 +139,12 @@ func Parse(body []byte) (Receipt, string) {
 	}
 	if !strings.EqualFold(f["status"], "successful") {
 		return Receipt{}, "ignored"
+	}
+	if strings.EqualFold(strings.TrimSpace(subject), "Internet Transaction Journal") {
+		if strings.EqualFold(f["transaction type"], "QRIS Payment") {
+			return parseQRISPayment(f)
+		}
+		return Receipt{}, "unsupported"
 	}
 	kind := "bca_transfer"
 	if strings.Contains(strings.ToLower(f["transfer type"]), "interbank") || f["beneficiary bank"] != "" {
@@ -208,10 +217,7 @@ func Parse(body []byte) (Receipt, string) {
 	if kind == "bca_transfer" {
 		f["beneficiary bank"] = "BCA"
 	}
-	source := f["source of fund"]
-	if len(source) > 4 && !strings.ContainsAny(source, "xX*") {
-		source = strings.Repeat("*", len(source)-4) + source[len(source)-4:]
-	}
+	source := maskSource(f["source of fund"])
 	masked := destination
 	if len(masked) > 4 {
 		masked = strings.Repeat("*", len(masked)-4) + masked[len(masked)-4:]
@@ -225,6 +231,39 @@ func Parse(body []byte) (Receipt, string) {
 		Currency: "IDR", Amount: fmt.Sprintf("%d.%02d", minor/100, minor%100), Fee: fee,
 		SourceAccountAlias: source, BeneficiaryBank: f["beneficiary bank"],
 		BeneficiaryAccountMasked: masked, BeneficiaryAccount: destination,
+		TransactionDateLocal: parsed.Format("2006-01-02T15:04:05"), Timezone: "Asia/Jakarta",
+	}, ""
+}
+
+func maskSource(source string) string {
+	if len(source) > 4 && !strings.ContainsAny(source, "xX*") {
+		return strings.Repeat("*", len(source)-4) + source[len(source)-4:]
+	}
+	return source
+}
+
+func parseQRISPayment(f map[string]string) (Receipt, string) {
+	amount, err := Money(f["total payment"])
+	if err != nil || amount <= 0 || !referencePattern.MatchString(f["reference no."]) ||
+		f["source of fund"] == "" || len(f["source of fund"]) > 80 || f["payment to"] == "" || len(f["payment to"]) > 200 ||
+		(f["currency"] != "" && f["currency"] != "IDR") {
+		return Receipt{}, "needs_review"
+	}
+	var parsed time.Time
+	for _, layout := range []string{"02 Jan 2006 15:04:05", "02/01/2006 15:04:05", "2006-01-02 15:04:05"} {
+		parsed, err = time.Parse(layout, f["transaction date"])
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return Receipt{}, "needs_review"
+	}
+	return Receipt{
+		ParserVersion: "bca-qris-payment-v1", BankReference: f["reference no."],
+		ReceiptKind: "bca_payment", Status: "successful", Currency: "IDR",
+		Amount:             fmt.Sprintf("%d.%02d", amount/100, amount%100),
+		SourceAccountAlias: maskSource(f["source of fund"]), PaymentTo: f["payment to"],
 		TransactionDateLocal: parsed.Format("2006-01-02T15:04:05"), Timezone: "Asia/Jakarta",
 	}, ""
 }

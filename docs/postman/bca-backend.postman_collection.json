@@ -1133,26 +1133,6 @@
       "name": "Manual Only",
       "item": [
         {
-          "name": "Open Google consent in browser",
-          "request": {
-            "method": "GET",
-            "header": [],
-            "url": "{{base_url}}/auth/google/start"
-          },
-          "response": [],
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test(\"HTTP 302\", () => pm.response.to.have.status(302));"
-                ]
-              }
-            }
-          ]
-        },
-        {
           "name": "Request immediate Gmail sync",
           "request": {
             "method": "POST",
@@ -1230,7 +1210,7 @@
           ]
         },
         {
-          "name": "Retry eligible failed import",
+          "name": "Retry review or unsupported import",
           "request": {
             "method": "POST",
             "header": [
@@ -1253,6 +1233,20 @@
               }
             }
           ]
+        },
+        {
+          "name": "Get import outcome",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports/{{import_id}}"
+          },
+          "response": []
         }
       ]
     }

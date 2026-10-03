@@ -2,6 +2,7 @@ package bca
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +39,23 @@ func TestReceipts(t *testing.T) {
 		if outcome != "" || r.ReceiptKind != tt.kind || r.Amount != tt.amount || (r.Fee != nil) != tt.fee {
 			t.Fatalf("%+v %s", r, outcome)
 		}
+	}
+}
+
+func TestQRISPayment(t *testing.T) {
+	body := []byte(fixture(t, "qris-payment.html"))
+	r, outcome := ParseWithSubject(body, "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.ParserVersion != "bca-qris-payment-v1" || r.Amount != "30000.00" || r.PaymentTo != "Example Merchant" || r.SourceAccountAlias != "Tahapan - 1234****56" || r.BeneficiaryAccountMasked != "" || r.TransactionDateLocal != "2026-10-02T11:20:40" {
+		t.Fatalf("unexpected QRIS result: %+v %s", r, outcome)
+	}
+	if _, outcome := ParseWithSubject(body, "Other subject"); outcome != "unsupported" {
+		t.Fatalf("wrong subject: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(string(body), "QRIS Payment", "Other Payment", 1)), "Internet Transaction Journal"); outcome != "unsupported" {
+		t.Fatalf("unknown journal layout: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(string(body), "IDR 30,000.00", "IDR bad", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid amount: %s", outcome)
 	}
 }
 

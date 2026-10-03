@@ -17,7 +17,13 @@ import (
 
 type MessageSource interface {
 	Metadata(context.Context, string) (string, error)
-	Full(context.Context, string) ([]byte, bool, error)
+	Full(context.Context, string) (FullMessage, error)
+}
+
+type FullMessage struct {
+	Body     []byte
+	Subject  string
+	Verified bool
 }
 
 type Provider struct{ API *gmail.Service }
@@ -57,27 +63,35 @@ func AuthorizedSender(ctx context.Context, source MessageSource, id string) (boo
 	return bca.ExactSender(from), nil
 }
 
-func (p Provider) Full(ctx context.Context, id string) ([]byte, bool, error) {
+func (p Provider) Full(ctx context.Context, id string) (FullMessage, error) {
 	m, err := p.API.Users.Messages.Get("me", id).Format("full").Fields("id,payload").Context(ctx).Do()
 	if err != nil {
-		return nil, false, err
+		return FullMessage{}, err
 	}
 	if m.Payload == nil {
-		return nil, false, errors.New("empty message")
+		return FullMessage{}, errors.New("empty message")
 	}
 	// Gmail prepends its receiver authentication result. Never trust body text as evidence.
-	verified := false
+	message := FullMessage{}
+	subjectSeen, authSeen := false, false
 	for _, h := range m.Payload.Headers {
-		if strings.EqualFold(h.Name, "Authentication-Results") {
+		if strings.EqualFold(h.Name, "Subject") {
+			if subjectSeen {
+				return FullMessage{}, errors.New("duplicate subject")
+			}
+			subjectSeen = true
+			message.Subject = h.Value
+		}
+		if strings.EqualFold(h.Name, "Authentication-Results") && !authSeen {
+			authSeen = true
 			v := strings.ToLower(strings.TrimSpace(h.Value))
-			verified = strings.HasPrefix(v, "mx.google.com;") && strings.Contains(v, "dkim=pass") &&
+			message.Verified = strings.HasPrefix(v, "mx.google.com;") && strings.Contains(v, "dkim=pass") &&
 				(strings.Contains(v, "header.i=@bca.co.id") || strings.Contains(v, "header.d=bca.co.id")) &&
 				strings.Contains(v, "dmarc=pass") && strings.Contains(v, "header.from=bca.co.id")
-			break
 		}
 	}
-	body, err := bestPart(m.Payload)
-	return body, verified, err
+	message.Body, err = bestPart(m.Payload)
+	return message, err
 }
 func bestPart(root *gmail.MessagePart) ([]byte, error) {
 	var htmlPart, plainPart *gmail.MessagePart

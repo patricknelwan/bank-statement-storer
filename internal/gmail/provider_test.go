@@ -15,9 +15,9 @@ type fakeSource struct {
 }
 
 func (f *fakeSource) Metadata(context.Context, string) (string, error) { return f.from, nil }
-func (f *fakeSource) Full(context.Context, string) ([]byte, bool, error) {
+func (f *fakeSource) Full(context.Context, string) (FullMessage, error) {
 	f.fullCalls++
-	return []byte("private"), true, nil
+	return FullMessage{Body: []byte("private"), Verified: true}, nil
 }
 func TestPrivacyGate(t *testing.T) {
 	for _, from := range []string{"BCA <fake@example.com>", "bca@bca.co.id.evil", "bca@bca.co.id, x@example.com"} {
@@ -52,5 +52,21 @@ func TestMetadataRequest(t *testing.T) {
 	ok, err := AuthorizedSender(context.Background(), Provider{API: api}, "test")
 	if err != nil || ok || count != 1 {
 		t.Fatalf("gate: ok=%v requests=%d err=%v", ok, count, err)
+	}
+}
+
+func TestFullSubject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"test","payload":{"mimeType":"text/html","body":{"data":"c3R1ZmY","size":5},"headers":[{"name":"Subject","value":"Internet Transaction Journal"},{"name":"Authentication-Results","value":"mx.google.com; dkim=pass header.i=@bca.co.id; dmarc=pass header.from=bca.co.id"}]}}`))
+	}))
+	defer server.Close()
+	api, err := gmailapi.NewService(context.Background(), option.WithEndpoint(server.URL+"/"), option.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := (Provider{API: api}).Full(context.Background(), "test")
+	if err != nil || message.Subject != "Internet Transaction Journal" || !message.Verified || string(message.Body) != "stuff" {
+		t.Fatalf("full message fields not extracted: subject=%q verified=%t error=%v", message.Subject, message.Verified, err)
 	}
 }

@@ -1,29 +1,23 @@
 services:
-  db:
-    image: postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
-    environment:
-      POSTGRES_DB: bca
-      POSTGRES_USER: bca
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-    volumes:
-      - postgres_local_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bca -d bca"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    networks: [private]
-    restart: unless-stopped
+  # The local PostgreSQL container is disabled; DATABASE_URL points to the host database.
+  # db:
+  #   image: postgres:17.11-trixie
+  #   environment:
+  #     POSTGRES_DB: bca
+  #     POSTGRES_USER: bca
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #   volumes:
+  #     - postgres_local_data:/var/lib/postgresql/data
   migrate:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     command: ["migrate"]
     environment: &app_env
-      DATABASE_URL: postgres://bca:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/bca?sslmode=disable
-      HTTP_ADDR: ":8080"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      HTTP_ADDR: "127.0.0.1:18080"
       PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL}
-      INTERNAL_INGEST_URL: http://127.0.0.1:8080/api/v1/webhooks/bca
+      INTERNAL_INGEST_URL: http://127.0.0.1:18080/api/v1/webhooks/bca
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:?set GOOGLE_REDIRECT_URI}
@@ -37,9 +31,7 @@ services:
       POLL_INTERVAL: 60s
       SOURCE_RETENTION_DAYS: 30
       TRUST_GMAIL_AUTH_RESULTS: ${TRUST_GMAIL_AUTH_RESULTS:-false}
-    depends_on:
-      db: {condition: service_healthy}
-    networks: [private]
+    network_mode: host
     restart: "no"
   service:
     build:
@@ -53,11 +45,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    ports:
-      - "127.0.0.1:18080:8080"
-    networks: [private]
+    network_mode: host
     restart: unless-stopped
-networks:
-  private:
-volumes:
-  postgres_local_data:
+# volumes:
+#   postgres_local_data:

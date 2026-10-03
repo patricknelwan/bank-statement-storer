@@ -42,10 +42,12 @@ func Validate(e Event) (int64, *int64, time.Time, error) {
 		return 0, nil, time.Time{}, Error{"invalid_event", 422}
 	}
 	if e.SourceMessageID == "" || len(e.SourceMessageID) > 255 || !reference.MatchString(e.BankReference) ||
-		(e.ReceiptKind != "bca_transfer" && e.ReceiptKind != "interbank_transfer") ||
+		(e.ReceiptKind != "bca_transfer" && e.ReceiptKind != "interbank_transfer" && e.ReceiptKind != "bca_payment") ||
 		e.Status != "successful" || e.Currency != "IDR" || e.Timezone != "Asia/Jakarta" ||
-		e.SourceAccountAlias == "" || len(e.SourceAccountAlias) > 80 || !strings.Contains(e.BeneficiaryAccountMasked, "*") || e.BeneficiaryAccount != "" ||
-		(e.ReceiptKind == "bca_transfer" && e.ParserVersion != "bca-account-v1") || (e.ReceiptKind == "interbank_transfer" && e.ParserVersion != "bca-interbank-v1") {
+		e.SourceAccountAlias == "" || len(e.SourceAccountAlias) > 80 || e.BeneficiaryAccount != "" ||
+		(e.ReceiptKind == "bca_transfer" && e.ParserVersion != "bca-account-v1") || (e.ReceiptKind == "interbank_transfer" && e.ParserVersion != "bca-interbank-v1") ||
+		(e.ReceiptKind == "bca_payment" && (e.ParserVersion != "bca-qris-payment-v1" || e.PaymentTo == "" || len(e.PaymentTo) > 200 || e.BeneficiaryBank != "" || e.BeneficiaryAccountMasked != "" || e.BeneficiaryMatchToken != "")) ||
+		(e.ReceiptKind != "bca_payment" && (e.PaymentTo != "" || !strings.Contains(e.BeneficiaryAccountMasked, "*"))) {
 		return 0, nil, time.Time{}, Error{"invalid_event", 422}
 	}
 	amount, err := bca.Money(e.Amount)
@@ -138,10 +140,10 @@ func (s Service) Ingest(ctx context.Context, e Event) (Result, error) {
 		}
 	}
 	var id string
-	err = tx.QueryRow(ctx, `INSERT INTO transactions(user_id,integration_id,bank_reference,receipt_kind,classification,occurred_at,source_local_time,source_timezone,amount_minor,fee_minor,currency,source_account_alias,beneficiary_bank,beneficiary_account_masked,beneficiary_match_token,parser_version)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'IDR',$11,$12,$13,$14,$15)
+	err = tx.QueryRow(ctx, `INSERT INTO transactions(user_id,integration_id,bank_reference,receipt_kind,classification,occurred_at,source_local_time,source_timezone,amount_minor,fee_minor,currency,source_account_alias,beneficiary_bank,beneficiary_account_masked,beneficiary_match_token,parser_version,payment_to)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'IDR',$11,$12,$13,$14,$15,$16)
 		ON CONFLICT(user_id,bank_reference,source_account_alias,receipt_kind) DO NOTHING RETURNING id`,
-		userID, integrationID, e.BankReference, e.ReceiptKind, classification, occurred, e.TransactionDateLocal, e.Timezone, amount, fee, e.SourceAccountAlias, e.BeneficiaryBank, e.BeneficiaryAccountMasked, match, e.ParserVersion).Scan(&id)
+		userID, integrationID, e.BankReference, e.ReceiptKind, classification, occurred, e.TransactionDateLocal, e.Timezone, amount, fee, e.SourceAccountAlias, e.BeneficiaryBank, e.BeneficiaryAccountMasked, match, e.ParserVersion, e.PaymentTo).Scan(&id)
 	created := err == nil
 	if !created {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -150,13 +152,13 @@ func (s Service) Ingest(ctx context.Context, e Event) (Result, error) {
 		var oldAmount int64
 		var oldFee *int64
 		var oldOccurred time.Time
-		var oldMasked, oldBank string
+		var oldMasked, oldBank, oldPaymentTo string
 		var oldMatch []byte
-		err = tx.QueryRow(ctx, `SELECT id,amount_minor,fee_minor,occurred_at,beneficiary_account_masked,coalesce(beneficiary_bank,''),beneficiary_match_token FROM transactions WHERE user_id=$1 AND bank_reference=$2 AND source_account_alias=$3 AND receipt_kind=$4`, userID, e.BankReference, e.SourceAccountAlias, e.ReceiptKind).Scan(&id, &oldAmount, &oldFee, &oldOccurred, &oldMasked, &oldBank, &oldMatch)
+		err = tx.QueryRow(ctx, `SELECT id,amount_minor,fee_minor,occurred_at,beneficiary_account_masked,coalesce(beneficiary_bank,''),beneficiary_match_token,payment_to FROM transactions WHERE user_id=$1 AND bank_reference=$2 AND source_account_alias=$3 AND receipt_kind=$4`, userID, e.BankReference, e.SourceAccountAlias, e.ReceiptKind).Scan(&id, &oldAmount, &oldFee, &oldOccurred, &oldMasked, &oldBank, &oldMatch, &oldPaymentTo)
 		if err != nil {
 			return Result{}, err
 		}
-		if oldAmount != amount || !equalFee(oldFee, fee) || !oldOccurred.Equal(occurred) || oldMasked != e.BeneficiaryAccountMasked || oldBank != e.BeneficiaryBank || subtle.ConstantTimeCompare(oldMatch, match) != 1 {
+		if oldAmount != amount || !equalFee(oldFee, fee) || !oldOccurred.Equal(occurred) || oldMasked != e.BeneficiaryAccountMasked || oldBank != e.BeneficiaryBank || oldPaymentTo != e.PaymentTo || subtle.ConstantTimeCompare(oldMatch, match) != 1 {
 			_, _ = tx.Exec(ctx, `UPDATE bca_email_jobs SET state='needs_review',reason_code='conflicting_reference',updated_at=now() WHERE id=$1`, e.SourceJobID)
 			if err = tx.Commit(ctx); err != nil {
 				return Result{}, err

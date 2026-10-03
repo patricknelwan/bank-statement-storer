@@ -16,14 +16,16 @@ Go 1.27.1 service for owner-only Gmail receipt discovery, BCA parsing, durable P
        cp .env.example .env
        chmod 600 .env
 
-   Fill `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OWNER_GOOGLE_SUB`. Generate and paste independent secrets: `openssl rand -hex 24` for `POSTGRES_PASSWORD` (hex keeps the database URL valid), `openssl rand -base64 32` for `TOKEN_ENCRYPTION_KEY`, and three separate `openssl rand -hex 32` values for `JWT_SIGNING_SECRET`, `ACCOUNT_HMAC_KEY`, and `WORKER_INGEST_TOKEN`. Leave `TRUST_GMAIL_AUTH_RESULTS=false`. Local setup does not use `TLS_CERT_PATH` or `TLS_KEY_PATH`.
+   Fill `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OWNER_GOOGLE_SUB`. Set `DATABASE_URL` to your PostgreSQL connection URI. For a PostgreSQL server on this Linux host using the `finance` database, the form is `postgres://USERNAME:PASSWORD@127.0.0.1:5432/finance?sslmode=disable`; replace the username and password and URL-encode any reserved characters in them. The JDBC `jdbc:` prefix is not accepted. The local Compose file uses host networking so `127.0.0.1:5432` reaches your PostgreSQL server. It does not create a database container; `POSTGRES_PASSWORD` is unused locally.
+
+   Generate and paste independent secrets: `openssl rand -base64 32` for `TOKEN_ENCRYPTION_KEY`, and three separate `openssl rand -hex 32` values for `JWT_SIGNING_SECRET`, `ACCOUNT_HMAC_KEY`, and `WORKER_INGEST_TOKEN`. Leave `TRUST_GMAIL_AUTH_RESULTS=false`. Local setup does not use `TLS_CERT_PATH` or `TLS_KEY_PATH`. Migrations create application tables in the configured database, including `users` and `transactions`; check for existing tables with those names before pointing the app at a populated `finance` database. The previous Docker database volume and its Gmail connection are not copied into your database.
 
 4. Start the local stack and check readiness:
 
-       docker compose --env-file .env -f deploy/compose.local.yml up -d --build
+       npm run dev
        curl -f http://127.0.0.1:18080/health/ready
 
-   Open `http://127.0.0.1:18080/auth/google/start` in a browser signed in as the owner. The callback displays a one-time code valid for 60 seconds. Import the [Postman collection and environment](docs/postman/README.md), set `base_url` to `http://127.0.0.1:18080`, paste the code into `login_code`, and run **Exchange login code**. The local service is bound to the host loopback address.
+   Open `http://127.0.0.1:18080/auth/google/start` in a browser signed in as the owner. The callback displays a one-time code valid for 60 seconds. Import the [Postman collection and environment](docs/postman/README.md), set `base_url` to `http://127.0.0.1:18080`, paste the code into `login_code`, and run **Exchange login code**. The local service is bound to the host loopback address. Reconnect Gmail after switching databases.
 
 If startup fails, inspect `docker compose --env-file .env -f deploy/compose.local.yml logs migrate service`. A `redirect_uri_mismatch` means the Google client redirect differs from `GOOGLE_REDIRECT_URI`; `owner identity rejected` means `OWNER_GOOGLE_SUB` belongs to a different Google account. The service also needs outbound access to Google's OpenID and Gmail APIs.
 
@@ -32,6 +34,8 @@ If startup fails, inspect `docker compose --env-file .env -f deploy/compose.loca
 Set `PUBLIC_URL` to the HTTPS origin and `GOOGLE_REDIRECT_URI` to that origin plus `/auth/google/callback`, register the exact redirect URI in Google Cloud, and set `TLS_CERT_PATH` and `TLS_KEY_PATH` to readable certificate and key files. Run `docker compose --env-file .env -f deploy/compose.yml up -d --build`. The migration service runs once before the application, and only the HTTPS proxy publishes ports.
 
 The worker starts immediately, then polls about every 60 seconds. Manual sync returns a durable operation ID; read its outcome at /api/v1/integrations/gmail/sync/{id} or in the integration status. A matching sender is selected using metadata-only From; nonmatching messages are never fetched in full. Automatic import also requires TRUST_GMAIL_AUTH_RESULTS=true after verifying in the authorized mailbox that Gmail adds the trusted receiver result and removes forged results. Until then matching receipts become review outcomes. Successful receipts are imported only when that receiver authentication check passes. Unknown or uncertain messages become review outcomes.
+
+The importer supports BCA transfer receipts and successful QRIS Payment receipts with the subject `Internet Transaction Journal`. QRIS payments appear as `bca_payment` with `payment_to` set to the merchant shown in the email. Other journal layouts remain unsupported. After updating an existing installation, use `POST /api/v1/imports/{id}/retry` with your bearer token to reprocess an earlier `unsupported` job, then check its status and the transactions endpoint. The retry fetches the email again from Gmail, so the integration must still be connected.
 
 ## Checks
 
