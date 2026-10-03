@@ -1,0 +1,12 @@
+{
+  "name": "bca-backend-tooling",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {"node": ">=24 <25"},
+  "scripts": {
+    "postman": "sh docs/postman/run.sh"
+  },
+  "devDependencies": {
+    "newman": "6.2.2"
+  }
+}

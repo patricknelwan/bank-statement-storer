@@ -1,0 +1,5 @@
+.env
+*.test
+bin/
+node_modules/
+docs/postman/newman-results.xml

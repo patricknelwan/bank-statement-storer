@@ -1,0 +1,86 @@
+name: Backend CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+        env:
+          POSTGRES_DB: bca_test
+          POSTGRES_USER: bca
+          POSTGRES_PASSWORD: synthetic_test_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U bca -d bca_test'
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://bca:synthetic_test_password@127.0.0.1:5432/bca_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://bca:synthetic_test_password@127.0.0.1:5432/bca_test?sslmode=disable
+      BCA_TEST_DATABASE: '1'
+      HTTP_ADDR: 127.0.0.1:18080
+      PUBLIC_URL: http://127.0.0.1:18080
+      POSTMAN_BASE_URL: http://127.0.0.1:18080
+      INTERNAL_INGEST_URL: http://127.0.0.1:18080/api/v1/webhooks/bca
+      GOOGLE_CLIENT_ID: synthetic-client
+      GOOGLE_CLIENT_SECRET: synthetic-secret
+      GOOGLE_REDIRECT_URI: http://127.0.0.1:18080/auth/google/callback
+      OWNER_GOOGLE_SUB: synthetic-test-owner
+      TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      JWT_SIGNING_SECRET: synthetic-jwt-secret-0000000000000000000000
+      ACCOUNT_HMAC_KEY: synthetic-hmac-secret-000000000000000000000
+      WORKER_INGEST_TOKEN: synthetic-worker-secret-00000000000000000000
+      BCA_SENDER: bca@bca.co.id
+      IMPORT_TIMEZONE: Asia/Jakarta
+      TRUST_GMAIL_AUTH_RESULTS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: go.mod, cache: true}
+      - uses: actions/setup-node@v4
+        with: {node-version: '24.15.0', cache: npm}
+      - run: go run ./cmd/service migrate
+      - run: go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
+      - run: git diff --exit-code -- internal/database
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go mod verify
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Start synthetic API
+        run: |
+          go run ./cmd/service > /tmp/bca-service.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/health/ready >/dev/null && exit 0
+            sleep 1
+          done
+          cat /tmp/bca-service.log
+          exit 1
+      - run: npm run postman
+        env: {POSTMAN_JUNIT: postman-results.xml}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: postman-junit, path: postman-results.xml, if-no-files-found: ignore}
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: {contents: read, packages: write}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}

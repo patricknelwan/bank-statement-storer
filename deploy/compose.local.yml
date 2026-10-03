@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    environment:
+      POSTGRES_DB: bca
+      POSTGRES_USER: bca
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bca -d bca"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [private]
+    restart: unless-stopped
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["migrate"]
+    environment: &app_env
+      DATABASE_URL: postgres://bca:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/bca?sslmode=disable
+      HTTP_ADDR: ":8080"
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL}
+      INTERNAL_INGEST_URL: http://127.0.0.1:8080/api/v1/webhooks/bca
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:?set GOOGLE_REDIRECT_URI}
+      OWNER_GOOGLE_SUB: ${OWNER_GOOGLE_SUB:?set OWNER_GOOGLE_SUB}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?set TOKEN_ENCRYPTION_KEY}
+      JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET:?set JWT_SIGNING_SECRET}
+      ACCOUNT_HMAC_KEY: ${ACCOUNT_HMAC_KEY:?set ACCOUNT_HMAC_KEY}
+      WORKER_INGEST_TOKEN: ${WORKER_INGEST_TOKEN:?set WORKER_INGEST_TOKEN}
+      BCA_SENDER: bca@bca.co.id
+      IMPORT_TIMEZONE: Asia/Jakarta
+      POLL_INTERVAL: 60s
+      SOURCE_RETENTION_DAYS: 30
+      TRUST_GMAIL_AUTH_RESULTS: ${TRUST_GMAIL_AUTH_RESULTS:-false}
+    depends_on:
+      db: {condition: service_healthy}
+    networks: [private]
+    restart: "no"
+  service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment: *app_env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "/app/service", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks: [private]
+    restart: unless-stopped
+networks:
+  private:
+volumes:
+  postgres_local_data:

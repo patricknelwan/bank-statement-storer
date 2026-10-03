@@ -1,0 +1,10 @@
+DROP TABLE transaction_audit;
+DROP TABLE owned_accounts;
+DROP TABLE transaction_sources;
+DROP TABLE transactions;
+DROP TABLE bca_email_jobs;
+DROP TABLE gmail_sync_state;
+DROP TABLE gmail_integrations;
+DROP TABLE auth_flows;
+DROP TABLE sessions;
+DROP TABLE users;
