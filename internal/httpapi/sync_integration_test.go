@@ -47,7 +47,7 @@ func TestManualSyncOutcomeIsDurable(t *testing.T) {
 	}
 	cfg := config.Config{JWTSecret: "synthetic-jwt-key-with-at-least-32-chars"}
 	identity := &auth.Service{DB: db, Config: cfg}
-	pair, err := identity.Exchange(ctx, code)
+	pair, err := identity.Exchange(ctx, code, "")
 	if err != nil {
 		t.Fatal(err)
 	}

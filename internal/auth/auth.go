@@ -14,6 +14,7 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -56,6 +57,20 @@ func Random() (string, error) {
 }
 func Hash(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
 
+var codeVerifierPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
+
+func appChallenge(verifier string) string {
+	if !codeVerifierPattern.MatchString(verifier) {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(Hash(verifier))
+}
+
+func validChallenge(challenge string) bool {
+	b, err := base64.RawURLEncoding.DecodeString(challenge)
+	return err == nil && len(b) == sha256.Size && base64.RawURLEncoding.EncodeToString(b) == challenge
+}
+
 func (s *Service) Encrypt(plain string, context string) ([]byte, error) {
 	block, err := aes.NewCipher(s.Config.EncryptionKey)
 	if err != nil {
@@ -90,7 +105,12 @@ func (s *Service) Decrypt(ciphertext []byte, context string) (string, error) {
 func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
 	publicURL, _ := url.Parse(s.Config.PublicURL)
 	if !strings.EqualFold((&url.URL{Host: r.Host}).Hostname(), publicURL.Hostname()) {
-		http.Redirect(w, r, strings.TrimRight(s.Config.PublicURL, "/")+"/auth/google/start", http.StatusFound)
+		http.Redirect(w, r, strings.TrimRight(s.Config.PublicURL, "/")+r.URL.RequestURI(), http.StatusFound)
+		return
+	}
+	client, challenge := r.URL.Query().Get("client"), r.URL.Query().Get("code_challenge")
+	if client != "" && client != "mobile" || client == "mobile" && (s.Config.MobileRedirectURI == "" || !validChallenge(challenge)) || client == "" && challenge != "" {
+		http.Error(w, "invalid client", http.StatusBadRequest)
 		return
 	}
 	state, e1 := Random()
@@ -100,7 +120,11 @@ func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", 503)
 		return
 	}
-	_, err := s.DB.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,nonce,pkce_verifier,expires_at) VALUES('oauth',$1,$2,$3,now()+interval '5 minutes')`, Hash(state), nonce, verifier)
+	var appChallenge any
+	if client == "mobile" {
+		appChallenge = challenge
+	}
+	_, err := s.DB.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,nonce,pkce_verifier,client_challenge,expires_at) VALUES('oauth',$1,$2,$3,$4,now()+interval '5 minutes')`, Hash(state), nonce, verifier, appChallenge)
 	if err != nil {
 		http.Error(w, "unavailable", 503)
 		return
@@ -117,9 +141,14 @@ func (s *Service) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var nonce, verifier string
-	err = s.DB.QueryRow(r.Context(), `UPDATE auth_flows SET consumed_at=now() WHERE kind='oauth' AND secret_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING nonce,pkce_verifier`, Hash(cookie.Value)).Scan(&nonce, &verifier)
+	var clientChallenge *string
+	err = s.DB.QueryRow(r.Context(), `UPDATE auth_flows SET consumed_at=now() WHERE kind='oauth' AND secret_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING nonce,pkce_verifier,client_challenge`, Hash(cookie.Value)).Scan(&nonce, &verifier, &clientChallenge)
 	if err != nil {
 		http.Error(w, "invalid authorization flow", 400)
+		return
+	}
+	if clientChallenge != nil && s.Config.MobileRedirectURI == "" {
+		http.Error(w, "mobile redirect unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	token, err := s.OAuth.Exchange(r.Context(), r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
@@ -191,13 +220,22 @@ func (s *Service) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", 503)
 		return
 	}
-	_, err = tx.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,user_id,expires_at) VALUES('login_code',$1,$2,now()+interval '60 seconds')`, Hash(code), userID)
+	_, err = tx.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,user_id,client_challenge,expires_at) VALUES('login_code',$1,$2,$3,now()+interval '60 seconds')`, Hash(code), userID, clientChallenge)
 	if err != nil || tx.Commit(r.Context()) != nil {
 		http.Error(w, "unavailable", 503)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	if clientChallenge != nil {
+		callback, _ := url.Parse(s.Config.MobileRedirectURI)
+		query := callback.Query()
+		query.Set("code", code)
+		callback.RawQuery = query.Encode()
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		http.Redirect(w, r, callback.String(), http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<!doctype html><html><body><h1>BCA connected</h1><p>Copy this one-time application code into Postman within 60 seconds:</p><code>%s</code></body></html>", html.EscapeString(code))
 }
 
@@ -224,9 +262,9 @@ func (s *Service) issue(ctx context.Context, userID, familyID string, expiry tim
 	return TokenPair{access, refresh, 900}, err
 }
 
-func (s *Service) Exchange(ctx context.Context, code string) (TokenPair, error) {
+func (s *Service) Exchange(ctx context.Context, code, verifier string) (TokenPair, error) {
 	var userID string
-	err := s.DB.QueryRow(ctx, `UPDATE auth_flows SET consumed_at=now() WHERE kind='login_code' AND secret_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`, Hash(code)).Scan(&userID)
+	err := s.DB.QueryRow(ctx, `UPDATE auth_flows SET consumed_at=now() WHERE kind='login_code' AND secret_hash=$1 AND (client_challenge IS NULL OR client_challenge=$2) AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`, Hash(code), appChallenge(verifier)).Scan(&userID)
 	if err != nil {
 		return TokenPair{}, errors.New("invalid code")
 	}

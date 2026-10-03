@@ -26,18 +26,23 @@ paths:
   /auth/google/start:
     get:
       operationId: googleStart
-      description: Open in a browser. Sets a short-lived state cookie and redirects to Google consent.
+      description: Open in a browser. Sets a short-lived state cookie and redirects to Google consent. For mobile, supply client=mobile and an S256 code_challenge; the server must have MOBILE_REDIRECT_URI configured.
+      parameters:
+        - {name: client, in: query, schema: {type: string, enum: [mobile]}, description: Omit for manual browser code display}
+        - {name: code_challenge, in: query, schema: {type: string, minLength: 43, maxLength: 43}, description: Base64url SHA-256 of the app's code verifier; required for mobile}
       responses:
         '302': {description: Google authorization redirect}
+        '400': {description: Invalid mobile client or challenge}
   /auth/google/callback:
     get:
       operationId: googleCallback
-      description: Google redirects here; a successful HTML page shows a one-time application login code.
+      description: Google redirects here; a successful manual flow shows a one-time application login code in HTML, while a mobile flow redirects to the configured app URI with the code in its query.
       parameters:
         - {name: state, in: query, required: true, schema: {type: string}}
         - {name: code, in: query, required: true, schema: {type: string}}
       responses:
         '200': {description: One-time code in HTML}
+        '302': {description: Mobile flow redirects to configured app URI with one-time code}
         '400': {description: Invalid or expired authorization state}
         '403': {description: Google subject is not the configured owner}
   /api/v1/auth/exchange:
@@ -47,10 +52,11 @@ paths:
         required: true
         content:
           application/json:
-            schema: {type: object, required: [code], additionalProperties: false, properties: {code: {type: string}}}
+            schema: {type: object, required: [code], additionalProperties: false, properties: {code: {type: string}, code_verifier: {type: string, description: Required when the code originated from a mobile flow}}}
       responses:
         '200': {description: Application tokens, content: {application/json: {schema: {$ref: '#/components/schemas/TokenPair'}}}}
         '401': {description: Invalid code, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: Missing or malformed code, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /api/v1/auth/refresh:
     post:
       operationId: refreshSession
@@ -90,7 +96,7 @@ paths:
       operationId: gmailStatus
       security: [{ownerBearer: []}]
       responses:
-        '200': {description: Connection status and last successful discovery}
+        '200': {description: Connection status and last successful discovery, content: {application/json: {schema: {$ref: '#/components/schemas/GmailIntegration'}}}}
     delete:
       operationId: gmailDisconnect
       security: [{ownerBearer: []}]
@@ -132,14 +138,14 @@ paths:
         - {$ref: '#/components/parameters/Cursor'}
         - {name: state, in: query, schema: {type: string, enum: [queued, processing, retry_wait, completed, ignored, unsupported, needs_review, failed]}, description: Filter jobs by state}
       responses:
-        '200': {description: BCA processing jobs without email content, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        '200': {description: BCA processing jobs without email content, content: {application/json: {schema: {$ref: '#/components/schemas/ImportPage'}}}}
   /api/v1/imports/{id}:
     get:
       operationId: getImport
       security: [{ownerBearer: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
-        '200': {description: Safe import outcome}
+        '200': {description: Safe import outcome, content: {application/json: {schema: {$ref: '#/components/schemas/ImportDetail'}}}}
         '404': {description: Import not found}
   /api/v1/imports/{id}/source:
     get:
@@ -198,7 +204,7 @@ paths:
       security: [{ownerBearer: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
-        '202': {description: Retry queued}
+        '202': {description: Retry queued, content: {application/json: {schema: {type: object, required: [id, state], properties: {id: {type: string, format: uuid}, state: {type: string, enum: [queued]}}}}}}
         '409': {description: Job not retryable}
   /api/v1/webhooks/bca:
     post:
@@ -223,13 +229,13 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
-        - {name: from, in: query, schema: {type: string, format: date}}
-        - {name: to, in: query, schema: {type: string, format: date}}
+        - {name: from, in: query, schema: {type: string, format: date}, description: Inclusive Asia/Jakarta calendar date}
+        - {name: to, in: query, schema: {type: string, format: date}, description: Inclusive Asia/Jakarta calendar date}
         - {name: bank, in: query, schema: {type: string}}
         - {name: classification, in: query, schema: {type: string, enum: [unclassified, expense, internal_transfer]}}
         - {name: account, in: query, schema: {type: string}}
       responses:
-        '200': {description: Transaction page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        '200': {description: Transaction page, content: {application/json: {schema: {$ref: '#/components/schemas/TransactionPage'}}}}
   /api/v1/transactions/{id}:
     get:
       operationId: getTransaction
@@ -262,7 +268,7 @@ paths:
       operationId: listOwnedAccounts
       security: [{ownerBearer: []}]
       responses:
-        '200': {description: Masked owned accounts}
+        '200': {description: Masked owned accounts, content: {application/json: {schema: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/OwnedAccount'}}}}}}}
     post:
       operationId: addOwnedAccount
       security: [{ownerBearer: []}]
@@ -279,7 +285,7 @@ paths:
                 account_number: {type: string, pattern: '^[0-9]{5,40}$', writeOnly: true}
                 label: {type: string}
       responses:
-        '201': {description: Only masked identifier is returned}
+        '201': {description: Only masked identifier is returned, content: {application/json: {schema: {$ref: '#/components/schemas/OwnedAccount'}}}}
 components:
   securitySchemes:
     ownerBearer: {type: http, scheme: bearer, bearerFormat: JWT}
@@ -302,6 +308,49 @@ components:
         access_token: {type: string}
         refresh_token: {type: string}
         expires_in: {type: integer, example: 900}
+    GmailIntegration:
+      type: object
+      required: [status]
+      description: When status is not_connected, the other fields are omitted.
+      properties:
+        status: {type: string, enum: [not_connected, connected, disconnected, reconnect_required]}
+        recovery_status: {type: string, enum: [initial, recovering, complete]}
+        last_success: {type: string, format: date-time, nullable: true}
+        last_operation:
+          type: object
+          nullable: true
+          required: [id, status]
+          properties:
+            id: {type: string, format: uuid}
+            status: {type: string, enum: [queued, running, completed, failed]}
+    ImportState: {type: string, enum: [queued, processing, retry_wait, completed, ignored, unsupported, needs_review, failed]}
+    ImportSummary:
+      type: object
+      required: [id, state, reason_code, attempts, created_at, transaction_id]
+      properties:
+        id: {type: string, format: uuid}
+        state: {$ref: '#/components/schemas/ImportState'}
+        reason_code: {type: string, nullable: true}
+        attempts: {type: integer}
+        created_at: {type: string, format: date-time}
+        transaction_id: {type: string, format: uuid, nullable: true, description: Present for a job linked to a transaction}
+    ImportDetail:
+      type: object
+      required: [id, state, reason_code, attempts, created_at, updated_at, transaction_id]
+      properties:
+        id: {type: string, format: uuid}
+        state: {$ref: '#/components/schemas/ImportState'}
+        reason_code: {type: string, nullable: true}
+        attempts: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        transaction_id: {type: string, format: uuid, nullable: true, description: Present for a job linked to a transaction}
+    ImportPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ImportSummary'}}
+        next_cursor: {type: string}
     Money: {type: string, pattern: '^[0-9]+\.[0-9]{2}$', example: '3300000.00'}
     BCAEvent:
       type: object
@@ -332,7 +381,7 @@ components:
         created: {type: boolean}
     Transaction:
       type: object
-      required: [id, amount, classification, version]
+      required: [id, bank_reference, receipt_kind, classification, occurred_at, amount, fee, currency, source_account_alias, beneficiary_bank, beneficiary_account_masked, note, version, created_at]
       properties:
         id: {type: string, format: uuid}
         bank_reference: {type: string}
@@ -349,9 +398,17 @@ components:
         note: {type: string}
         version: {type: integer}
         created_at: {type: string, format: date-time}
-    Page:
+    TransactionPage:
       type: object
       required: [items, next_cursor]
       properties:
-        items: {type: array, items: {type: object}}
+        items: {type: array, items: {$ref: '#/components/schemas/Transaction'}}
         next_cursor: {type: string}
+    OwnedAccount:
+      type: object
+      required: [id, bank, masked_identifier, label]
+      properties:
+        id: {type: string, format: uuid}
+        bank: {type: string}
+        masked_identifier: {type: string}
+        label: {type: string}

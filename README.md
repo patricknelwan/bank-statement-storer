@@ -2,6 +2,8 @@
 
 Go 1.27.1 service for owner-only Gmail receipt discovery, BCA parsing, durable PostgreSQL jobs, protected ingestion, and transaction APIs. The detailed behavior is in [the implementation plan](bca-backend-implementation-plan.md).
 
+For mobile app prototyping, see the [backend integration guide](docs/mobile-backend-guide.md) for the implemented API, authentication flow, response shapes, and current client constraints.
+
 ## Run locally
 
 1. Create a Google Cloud project, enable the Gmail API, and configure the Google Auth Platform consent screen. Add the mailbox owner as a test user if the app is in Testing. Create an OAuth client of type **Web application** with these authorized redirect URIs:
@@ -17,6 +19,8 @@ Go 1.27.1 service for owner-only Gmail receipt discovery, BCA parsing, durable P
        chmod 600 .env
 
    Fill `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OWNER_GOOGLE_SUB`. Set `DATABASE_URL` to your PostgreSQL connection URI. For a PostgreSQL server on this Linux host using the `finance` database, the form is `postgres://USERNAME:PASSWORD@127.0.0.1:5432/finance?sslmode=disable`; replace the username and password and URL-encode any reserved characters in them. The JDBC `jdbc:` prefix is not accepted. The local Compose file uses host networking so `127.0.0.1:5432` reaches your PostgreSQL server. It does not create a database container; `POSTGRES_PASSWORD` is unused locally.
+
+   For mobile sign-in, optionally set `MOBILE_REDIRECT_URI` to a URI registered by your app (for example `bcatracking://auth/callback`). The backend redirects there with a one-time code after Google consent. The app must start sign-in with an S256 challenge and exchange the code with its verifier; see the [mobile guide](docs/mobile-backend-guide.md). Leave this variable empty for the existing manual browser/Postman flow.
 
    Generate and paste independent secrets: `openssl rand -base64 32` for `TOKEN_ENCRYPTION_KEY`, and three separate `openssl rand -hex 32` values for `JWT_SIGNING_SECRET`, `ACCOUNT_HMAC_KEY`, and `WORKER_INGEST_TOKEN`. Leave `TRUST_GMAIL_AUTH_RESULTS=false`. Local setup does not use `TLS_CERT_PATH` or `TLS_KEY_PATH`. Migrations create application tables in the configured database, including `users` and `transactions`; check for existing tables with those names before pointing the app at a populated `finance` database. The previous Docker database volume and its Gmail connection are not copied into your database.
 

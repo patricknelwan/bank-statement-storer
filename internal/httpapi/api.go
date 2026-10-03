@@ -115,13 +115,14 @@ func (a API) Router() http.Handler {
 }
 func (a API) exchange(w http.ResponseWriter, r *http.Request) {
 	var q struct {
-		Code string `json:"code"`
+		Code         string `json:"code"`
+		CodeVerifier string `json:"code_verifier"`
 	}
 	if decode(r, &q) != nil || q.Code == "" {
 		fail(w, r, 422, "invalid_code")
 		return
 	}
-	pair, err := a.Auth.Exchange(r.Context(), q.Code)
+	pair, err := a.Auth.Exchange(r.Context(), q.Code, q.CodeVerifier)
 	if err != nil {
 		fail(w, r, 401, "invalid_code")
 		return
@@ -308,8 +309,9 @@ func (a API) imports(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 422, "invalid_state")
 		return
 	}
-	rows, err := a.DB.Query(r.Context(), `SELECT j.id,j.state,j.reason_code,j.attempts,j.created_at
+	rows, err := a.DB.Query(r.Context(), `SELECT j.id,j.state,j.reason_code,j.attempts,j.created_at,ts.transaction_id
 		FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id
+		LEFT JOIN transaction_sources ts ON ts.job_id=j.id
 		WHERE i.user_id=$1 AND ($2='' OR j.state=$2) AND ($3::timestamptz IS NULL OR (j.created_at,j.id)<($3,$4::uuid))
 		ORDER BY j.created_at DESC,j.id DESC LIMIT $5`, auth.FromContext(r.Context()).UserID, state, nullableTime(c.At), nullableID(c.ID), limit+1)
 	if err != nil {
@@ -318,16 +320,18 @@ func (a API) imports(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	type item struct {
-		ID, State  string
-		ReasonCode *string   `json:"reason_code"`
-		Attempts   int       `json:"attempts"`
-		CreatedAt  time.Time `json:"created_at"`
+		ID            string    `json:"id"`
+		State         string    `json:"state"`
+		ReasonCode    *string   `json:"reason_code"`
+		Attempts      int       `json:"attempts"`
+		CreatedAt     time.Time `json:"created_at"`
+		TransactionID *string   `json:"transaction_id"`
 	}
 	items := []item{}
 	next := ""
 	for rows.Next() {
 		var x item
-		if rows.Scan(&x.ID, &x.State, &x.ReasonCode, &x.Attempts, &x.CreatedAt) != nil {
+		if rows.Scan(&x.ID, &x.State, &x.ReasonCode, &x.Attempts, &x.CreatedAt, &x.TransactionID) != nil {
 			fail(w, r, 503, "unavailable")
 			return
 		}
@@ -363,10 +367,10 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var state string
-	var reason *string
+	var reason, transactionID *string
 	var attempts int
 	var created, updated time.Time
-	err := a.DB.QueryRow(r.Context(), `SELECT j.state,j.reason_code,j.attempts,j.created_at,j.updated_at FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&state, &reason, &attempts, &created, &updated)
+	err := a.DB.QueryRow(r.Context(), `SELECT j.state,j.reason_code,j.attempts,j.created_at,j.updated_at,ts.transaction_id FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id LEFT JOIN transaction_sources ts ON ts.job_id=j.id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&state, &reason, &attempts, &created, &updated, &transactionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fail(w, r, 404, "import_not_found")
 		return
@@ -375,7 +379,7 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "unavailable")
 		return
 	}
-	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated})
+	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated, "transaction_id": transactionID})
 }
 
 func (a API) importSource(w http.ResponseWriter, r *http.Request) {
@@ -506,8 +510,8 @@ func (a API) transactions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows, err := a.DB.Query(r.Context(), `SELECT `+transactionColumns+` FROM transactions t WHERE t.user_id=$1
-		AND ($2='' OR t.classification=$2) AND ($3::date IS NULL OR t.occurred_at >= $3::date)
-		AND ($4::date IS NULL OR t.occurred_at < ($4::date+interval '1 day'))
+		AND ($2='' OR t.classification=$2) AND ($3::date IS NULL OR t.occurred_at >= ($3::date::timestamp AT TIME ZONE 'Asia/Jakarta'))
+		AND ($4::date IS NULL OR t.occurred_at < (($4::date+1)::timestamp AT TIME ZONE 'Asia/Jakarta'))
 		AND ($5='' OR t.beneficiary_bank=$5) AND ($6='' OR t.source_account_alias=$6)
 		AND ($7::timestamptz IS NULL OR (t.created_at,t.id)<($7,$8::uuid))
 		ORDER BY t.created_at DESC,t.id DESC LIMIT $9`,

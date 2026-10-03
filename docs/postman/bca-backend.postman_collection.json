@@ -206,7 +206,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
-                  "pm.expect(pm.response.json().items).to.be.an(\"array\");"
+                  "const items=pm.response.json().items; pm.expect(items).to.be.an(\"array\"); if(items.length){pm.expect(items[0]).to.have.all.keys(\"id\",\"state\",\"reason_code\",\"attempts\",\"created_at\",\"transaction_id\");}"
                 ]
               }
             }
@@ -232,7 +232,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
-                  "pm.expect(pm.response.json().id).to.equal(pm.environment.get(\"account_job_id\"));"
+                  "const job=pm.response.json(); pm.expect(job.id).to.equal(pm.environment.get(\"account_job_id\")); pm.expect(job).to.have.property(\"transaction_id\");"
                 ]
               }
             }

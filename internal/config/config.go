@@ -14,6 +14,7 @@ import (
 type Config struct {
 	DatabaseURL, HTTPAddr, PublicURL, InternalIngestURL                   string
 	GoogleClientID, GoogleClientSecret, GoogleRedirectURI, OwnerGoogleSub string
+	MobileRedirectURI                                                     string
 	WorkerToken, JWTSecret, AccountHMACKey                                string
 	EncryptionKey                                                         []byte
 	PollInterval                                                          time.Duration
@@ -28,7 +29,8 @@ func Load() (Config, error) {
 		PublicURL: os.Getenv("PUBLIC_URL"), InternalIngestURL: os.Getenv("INTERNAL_INGEST_URL"),
 		GoogleClientID: os.Getenv("GOOGLE_CLIENT_ID"), GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleRedirectURI: os.Getenv("GOOGLE_REDIRECT_URI"), OwnerGoogleSub: os.Getenv("OWNER_GOOGLE_SUB"),
-		WorkerToken: os.Getenv("WORKER_INGEST_TOKEN"), JWTSecret: os.Getenv("JWT_SIGNING_SECRET"),
+		MobileRedirectURI: os.Getenv("MOBILE_REDIRECT_URI"),
+		WorkerToken:       os.Getenv("WORKER_INGEST_TOKEN"), JWTSecret: os.Getenv("JWT_SIGNING_SECRET"),
 		AccountHMACKey: os.Getenv("ACCOUNT_HMAC_KEY"), Sender: os.Getenv("BCA_SENDER"),
 		Timezone: os.Getenv("IMPORT_TIMEZONE"),
 	}
@@ -91,5 +93,20 @@ func Load() (Config, error) {
 	if strings.TrimRight(c.GoogleRedirectURI, "/") != strings.TrimRight(c.PublicURL, "/")+"/auth/google/callback" {
 		return c, errors.New("GOOGLE_REDIRECT_URI must match PUBLIC_URL/auth/google/callback")
 	}
+	if c.MobileRedirectURI != "" {
+		u, err := url.Parse(c.MobileRedirectURI)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !safeMobileScheme(u.Scheme) {
+			return c, errors.New("MOBILE_REDIRECT_URI must be an HTTPS or app-scheme URI without query or fragment")
+		}
+	}
 	return c, nil
+}
+
+func safeMobileScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "javascript", "data", "file", "ftp", "mailto", "about":
+		return false
+	default:
+		return true
+	}
 }
