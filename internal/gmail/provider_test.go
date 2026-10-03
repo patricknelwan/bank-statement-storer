@@ -2,6 +2,9 @@ package gmail
 
 import (
 	"context"
+	"encoding/base64"
+	"example.com/bca/internal/config"
+	"fmt"
 	gmailapi "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 	"net/http"
@@ -68,5 +71,36 @@ func TestFullSubject(t *testing.T) {
 	message, err := (Provider{API: api}).Full(context.Background(), "test")
 	if err != nil || message.Subject != "Internet Transaction Journal" || !message.Verified || string(message.Body) != "stuff" {
 		t.Fatalf("full message fields not extracted: subject=%q verified=%t error=%v", message.Subject, message.Verified, err)
+	}
+}
+
+func TestInspectUnsupportedChecksSender(t *testing.T) {
+	from := "bca@bca.co.id"
+	fullCalls := 0
+	body := `<table><tr><td>Status</td><td>Successful</td></tr><tr><td>Transaction Type</td><td>Card Payment</td></tr></table>`
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(body))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("format") == "metadata" {
+			fmt.Fprintf(w, `{"payload":{"headers":[{"name":"From","value":%q}]}}`, from)
+			return
+		}
+		fullCalls++
+		fmt.Fprintf(w, `{"payload":{"mimeType":"text/html","body":{"data":%q,"size":%d},"headers":[{"name":"Subject","value":"Internet Transaction Journal"},{"name":"Authentication-Results","value":"mx.google.com; dkim=pass header.i=@bca.co.id; dmarc=pass header.from=bca.co.id"}]}}`, encoded, len(body))
+	}))
+	defer server.Close()
+	api, err := gmailapi.NewService(context.Background(), option.WithEndpoint(server.URL+"/"), option.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := Worker{Config: config.Config{TrustGmailAuthResults: true}, providerFactory: func(context.Context, string) (*Provider, error) { return &Provider{API: api}, nil }}
+	d, err := worker.Inspect(context.Background(), "integration", "message")
+	if err != nil || d.ReasonCode != "parser_unsupported_transaction_type" || d.TransactionType != "Card Payment" || fullCalls != 1 {
+		t.Fatalf("inspection failed: %+v err=%v full=%d", d, err, fullCalls)
+	}
+	from = "someone@example.com"
+	d, err = worker.Inspect(context.Background(), "integration", "message")
+	if err != nil || d.ReasonCode != "sender_changed" || fullCalls != 1 {
+		t.Fatalf("sender gate failed: %+v err=%v full=%d", d, err, fullCalls)
 	}
 }

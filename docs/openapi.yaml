@@ -130,6 +130,7 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
+        - {name: state, in: query, schema: {type: string, enum: [queued, processing, retry_wait, completed, ignored, unsupported, needs_review, failed]}, description: Filter jobs by state}
       responses:
         '200': {description: BCA processing jobs without email content, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
   /api/v1/imports/{id}:
@@ -140,6 +141,36 @@ paths:
       responses:
         '200': {description: Safe import outcome}
         '404': {description: Import not found}
+  /api/v1/imports/{id}/inspect:
+    get:
+      operationId: inspectUnsupportedImport
+      description: Owner-only on-demand inspection of one unsupported job. Refetches the BCA email after sender and receiver-authentication checks, returns bounded layout clues, and does not store the message or change the job.
+      security: [{ownerBearer: []}]
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses:
+        '200':
+          description: Current parser diagnosis
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  job_state: {type: string, enum: [unsupported]}
+                  diagnostic:
+                    type: object
+                    properties:
+                      parser_outcome: {type: string, enum: [supported, unsupported, ignored, needs_review, not_checked]}
+                      reason_code: {type: string}
+                      retry_recommended: {type: boolean, description: True when the current parser supports this previously unsupported job; inspection itself does not retry it}
+                      subject: {type: string, description: Bounded subject preview; this field contains email content}
+                      transaction_type: {type: string, description: Bounded transaction type preview}
+                      transfer_type: {type: string, description: Bounded transfer type preview}
+                      detected_fields: {type: array, items: {type: string}, description: Allowlisted field labels only}
+                      receipt_kind: {type: string}
+        '404': {description: Import not found or not owned}
+        '409': {description: Job is not unsupported}
+        '503': {description: Gmail inspection unavailable}
   /api/v1/imports/{id}/retry:
     post:
       operationId: retryImport
@@ -258,7 +289,7 @@ components:
       properties:
         source_job_id: {type: string, format: uuid}
         source_message_id: {type: string}
-        parser_version: {type: string, enum: [bca-account-v1, bca-interbank-v1, bca-qris-payment-v1]}
+        parser_version: {type: string, enum: [bca-account-v1, bca-interbank-v1, bca-qris-payment-v1, bca-flazz-top-up-v1, bca-qris-transfer-v1]}
         bank_reference: {type: string}
         receipt_kind: {type: string, enum: [bca_transfer, interbank_transfer, bca_payment]}
         status: {type: string, enum: [successful]}
@@ -268,7 +299,7 @@ components:
         source_account_alias: {type: string}
         beneficiary_bank: {type: string}
         beneficiary_account_masked: {type: string}
-        payment_to: {type: string, description: QRIS merchant or recipient shown on the receipt}
+        payment_to: {type: string, description: QRIS recipient or masked Flazz card shown on the receipt}
         beneficiary_match_token: {type: string, pattern: '^[0-9a-f]{64}$'}
         transaction_date_local: {type: string, example: '2026-10-02T11:20:40'}
         timezone: {type: string, enum: [Asia/Jakarta]}
@@ -293,7 +324,7 @@ components:
         source_account_alias: {type: string}
         beneficiary_bank: {type: string}
         beneficiary_account_masked: {type: string}
-        payment_to: {type: string, description: QRIS merchant or recipient shown on the receipt}
+        payment_to: {type: string, description: QRIS recipient or masked Flazz card shown on the receipt}
         note: {type: string}
         version: {type: integer}
         created_at: {type: string, format: date-time}

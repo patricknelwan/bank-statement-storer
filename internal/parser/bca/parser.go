@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/html"
 )
@@ -34,6 +35,18 @@ type Receipt struct {
 	PaymentTo                string  `json:"payment_to,omitempty"`
 	TransactionDateLocal     string  `json:"transaction_date_local"`
 	Timezone                 string  `json:"timezone"`
+}
+
+// Diagnostic returns bounded subject and type previews plus allowlisted field names.
+type Diagnostic struct {
+	ParserOutcome    string   `json:"parser_outcome"`
+	ReasonCode       string   `json:"reason_code"`
+	RetryRecommended bool     `json:"retry_recommended"`
+	Subject          string   `json:"subject,omitempty"`
+	TransactionType  string   `json:"transaction_type,omitempty"`
+	TransferType     string   `json:"transfer_type,omitempty"`
+	DetectedFields   []string `json:"detected_fields"`
+	ReceiptKind      string   `json:"receipt_kind,omitempty"`
 }
 
 func ExactSender(from string) bool {
@@ -121,7 +134,7 @@ func fieldsFromHTML(body []byte) (map[string]string, error) {
 // Parse returns ignored, unsupported, or needs_review for emails that cannot be imported.
 func Parse(body []byte) (Receipt, string) { return ParseWithSubject(body, "") }
 
-func ParseWithSubject(body []byte, subject string) (Receipt, string) {
+func extractFields(body []byte) (map[string]string, error) {
 	f, err := fieldsFromHTML(body)
 	if err == nil && len(f) == 0 {
 		for _, line := range strings.Split(string(body), "\n") {
@@ -131,6 +144,11 @@ func ParseWithSubject(body []byte, subject string) (Receipt, string) {
 			}
 		}
 	}
+	return f, err
+}
+
+func ParseWithSubject(body []byte, subject string) (Receipt, string) {
+	f, err := extractFields(body)
 	if err != nil {
 		return Receipt{}, "needs_review"
 	}
@@ -144,7 +162,18 @@ func ParseWithSubject(body []byte, subject string) (Receipt, string) {
 		if strings.EqualFold(f["transaction type"], "QRIS Payment") {
 			return parseQRISPayment(f)
 		}
-		return Receipt{}, "unsupported"
+		if strings.EqualFold(f["transaction type"], "Flazz Top Up") {
+			return parseFlazzTopUp(f)
+		}
+		if f["transaction type"] != "" {
+			return Receipt{}, "unsupported"
+		}
+		if strings.EqualFold(f["type of transaction"], "QRIS Transfer") {
+			return parseQRISTransfer(f)
+		}
+		if f["type of transaction"] != "" {
+			return Receipt{}, "unsupported"
+		}
 	}
 	kind := "bca_transfer"
 	if strings.Contains(strings.ToLower(f["transfer type"]), "interbank") || f["beneficiary bank"] != "" {
@@ -235,6 +264,58 @@ func ParseWithSubject(body []byte, subject string) (Receipt, string) {
 	}, ""
 }
 
+func preview(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, normalize(s))
+	runes := []rune(s)
+	if len(runes) > 120 {
+		return string(runes[:120])
+	}
+	return s
+}
+
+func Diagnose(body []byte, subject string) Diagnostic {
+	receipt, outcome := ParseWithSubject(body, subject)
+	d := Diagnostic{ParserOutcome: outcome, ReasonCode: "parser_" + outcome, Subject: preview(subject), DetectedFields: []string{}}
+	if outcome == "" {
+		d.ParserOutcome, d.ReasonCode, d.ReceiptKind = "supported", "supported_now", receipt.ReceiptKind
+		d.RetryRecommended = true
+	}
+	f, err := extractFields(body)
+	if err != nil {
+		return d
+	}
+	d.TransactionType, d.TransferType = preview(f["transaction type"]), preview(f["transfer type"])
+	if d.TransactionType == "" {
+		d.TransactionType = preview(f["type of transaction"])
+	}
+	for _, name := range []string{"status", "transaction type", "type of transaction", "transfer type", "transaction date", "payment to", "source of fund", "total payment", "top up amount", "flazz card number", "transfer amount", "amount", "beneficiary account", "beneficiary bank", "beneficiary name", "beneficiary pan", "acquirer", "reference no."} {
+		if f[name] != "" {
+			d.DetectedFields = append(d.DetectedFields, name)
+		}
+	}
+	if outcome != "unsupported" {
+		return d
+	}
+	switch {
+	case f["status"] == "":
+		d.ReasonCode = "parser_missing_status"
+	case strings.EqualFold(strings.TrimSpace(subject), "Internet Transaction Journal") && (f["transaction type"] != "" || f["type of transaction"] != ""):
+		d.ReasonCode = "parser_unsupported_transaction_type"
+	case strings.EqualFold(strings.TrimSpace(subject), "Internet Transaction Journal") && f["transfer type"] == "":
+		d.ReasonCode = "parser_missing_transaction_type"
+	case f["transfer type"] == "":
+		d.ReasonCode = "parser_missing_transfer_type"
+	default:
+		d.ReasonCode = "parser_unsupported_transfer_type"
+	}
+	return d
+}
+
 func maskSource(source string) string {
 	if len(source) > 4 && !strings.ContainsAny(source, "xX*") {
 		return strings.Repeat("*", len(source)-4) + source[len(source)-4:]
@@ -243,9 +324,48 @@ func maskSource(source string) string {
 }
 
 func parseQRISPayment(f map[string]string) (Receipt, string) {
-	amount, err := Money(f["total payment"])
+	return parseJournalPayment(f, "total payment", f["payment to"], "bca-qris-payment-v1")
+}
+
+func digitsOnly(raw string, length int) (string, bool) {
+	clean := strings.NewReplacer(" ", "", "-", "").Replace(raw)
+	if len(clean) != length {
+		return "", false
+	}
+	for _, r := range clean {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return clean, true
+}
+
+func parseFlazzTopUp(f map[string]string) (Receipt, string) {
+	card, ok := digitsOnly(f["flazz card number"], 16)
+	if !ok {
+		return Receipt{}, "needs_review"
+	}
+	masked := strings.Repeat("*", len(card)-4) + card[len(card)-4:]
+	return parseJournalPayment(f, "top up amount", "Flazz "+masked, "bca-flazz-top-up-v1")
+}
+
+func parseQRISTransfer(f map[string]string) (Receipt, string) {
+	account := strings.NewReplacer(" ", "", "-", "").Replace(f["beneficiary account"])
+	if len(account) < 5 || len(account) > 40 || f["acquirer"] == "" || f["beneficiary name"] == "" || len(f["beneficiary pan"]) < 16 || len(f["beneficiary pan"]) > 19 {
+		return Receipt{}, "needs_review"
+	}
+	for _, r := range account + f["beneficiary pan"] {
+		if r < '0' || r > '9' {
+			return Receipt{}, "needs_review"
+		}
+	}
+	return parseJournalPayment(f, "amount", f["beneficiary name"], "bca-qris-transfer-v1")
+}
+
+func parseJournalPayment(f map[string]string, amountField, paymentTo, version string) (Receipt, string) {
+	amount, err := Money(f[amountField])
 	if err != nil || amount <= 0 || !referencePattern.MatchString(f["reference no."]) ||
-		f["source of fund"] == "" || len(f["source of fund"]) > 80 || f["payment to"] == "" || len(f["payment to"]) > 200 ||
+		f["source of fund"] == "" || len(f["source of fund"]) > 80 || paymentTo == "" || len(paymentTo) > 200 ||
 		(f["currency"] != "" && f["currency"] != "IDR") {
 		return Receipt{}, "needs_review"
 	}
@@ -260,10 +380,10 @@ func parseQRISPayment(f map[string]string) (Receipt, string) {
 		return Receipt{}, "needs_review"
 	}
 	return Receipt{
-		ParserVersion: "bca-qris-payment-v1", BankReference: f["reference no."],
+		ParserVersion: version, BankReference: f["reference no."],
 		ReceiptKind: "bca_payment", Status: "successful", Currency: "IDR",
 		Amount:             fmt.Sprintf("%d.%02d", amount/100, amount%100),
-		SourceAccountAlias: maskSource(f["source of fund"]), PaymentTo: f["payment to"],
+		SourceAccountAlias: maskSource(f["source of fund"]), PaymentTo: paymentTo,
 		TransactionDateLocal: parsed.Format("2006-01-02T15:04:05"), Timezone: "Asia/Jakarta",
 	}, ""
 }

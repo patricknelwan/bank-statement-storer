@@ -102,6 +102,7 @@ func (a API) Router() http.Handler {
 		r.Get("/api/v1/integrations/gmail/sync/{id}", a.syncOperation)
 		r.Get("/api/v1/imports", a.imports)
 		r.Get("/api/v1/imports/{id}", a.importDetail)
+		r.With(throttle(controlRate)).Get("/api/v1/imports/{id}/inspect", a.inspectImport)
 		r.With(throttle(controlRate)).Post("/api/v1/imports/{id}/retry", a.retry)
 		r.Get("/api/v1/transactions", a.transactions)
 		r.Get("/api/v1/transactions/{id}", a.transactionDetail)
@@ -299,10 +300,17 @@ func (a API) imports(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 422, "invalid_page")
 		return
 	}
+	state := r.URL.Query().Get("state")
+	switch state {
+	case "", "queued", "processing", "retry_wait", "completed", "ignored", "unsupported", "needs_review", "failed":
+	default:
+		fail(w, r, 422, "invalid_state")
+		return
+	}
 	rows, err := a.DB.Query(r.Context(), `SELECT j.id,j.state,j.reason_code,j.attempts,j.created_at
 		FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id
-		WHERE i.user_id=$1 AND ($2::timestamptz IS NULL OR (j.created_at,j.id)<($2,$3::uuid))
-		ORDER BY j.created_at DESC,j.id DESC LIMIT $4`, auth.FromContext(r.Context()).UserID, nullableTime(c.At), nullableID(c.ID), limit+1)
+		WHERE i.user_id=$1 AND ($2='' OR j.state=$2) AND ($3::timestamptz IS NULL OR (j.created_at,j.id)<($3,$4::uuid))
+		ORDER BY j.created_at DESC,j.id DESC LIMIT $5`, auth.FromContext(r.Context()).UserID, state, nullableTime(c.At), nullableID(c.ID), limit+1)
 	if err != nil {
 		fail(w, r, 503, "unavailable")
 		return
@@ -367,6 +375,35 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated})
+}
+
+func (a API) inspectImport(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var integrationID, messageID, state string
+	err := a.DB.QueryRow(r.Context(), `SELECT j.integration_id,j.message_id,j.state FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&integrationID, &messageID, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fail(w, r, 404, "import_not_found")
+		return
+	}
+	if err != nil {
+		fail(w, r, 503, "unavailable")
+		return
+	}
+	if state != "unsupported" {
+		fail(w, r, 409, "import_not_unsupported")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	diagnostic, err := a.Worker.Inspect(ctx, integrationID, messageID)
+	if err != nil {
+		fail(w, r, 503, "inspection_unavailable")
+		return
+	}
+	jsonOut(w, 200, map[string]any{"id": id, "job_state": state, "diagnostic": diagnostic})
 }
 func (a API) retry(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
