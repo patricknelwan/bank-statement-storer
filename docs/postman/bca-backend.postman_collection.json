@@ -1249,6 +1249,20 @@
           "response": []
         },
         {
+          "name": "Find source email in Gmail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports/{{import_id}}/source"
+          },
+          "response": []
+        },
+        {
           "name": "List unsupported imports",
           "request": {
             "method": "GET",

@@ -102,6 +102,7 @@ func (a API) Router() http.Handler {
 		r.Get("/api/v1/integrations/gmail/sync/{id}", a.syncOperation)
 		r.Get("/api/v1/imports", a.imports)
 		r.Get("/api/v1/imports/{id}", a.importDetail)
+		r.With(throttle(controlRate)).Get("/api/v1/imports/{id}/source", a.importSource)
 		r.With(throttle(controlRate)).Get("/api/v1/imports/{id}/inspect", a.inspectImport)
 		r.With(throttle(controlRate)).Post("/api/v1/imports/{id}/retry", a.retry)
 		r.Get("/api/v1/transactions", a.transactions)
@@ -375,6 +376,31 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated})
+}
+
+func (a API) importSource(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var integrationID, messageID string
+	err := a.DB.QueryRow(r.Context(), `SELECT j.integration_id,j.message_id FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&integrationID, &messageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fail(w, r, 404, "import_not_found")
+		return
+	}
+	if err != nil {
+		fail(w, r, 503, "unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	source, err := a.Worker.FindSource(ctx, integrationID, messageID)
+	if err != nil {
+		fail(w, r, 503, "source_unavailable")
+		return
+	}
+	jsonOut(w, 200, map[string]string{"id": id, "subject": source.Subject, "date": source.Date, "gmail_search": source.GmailSearch})
 }
 
 func (a API) inspectImport(w http.ResponseWriter, r *http.Request) {

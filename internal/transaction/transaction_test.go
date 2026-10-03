@@ -39,12 +39,16 @@ func TestValidateQRISPayment(t *testing.T) {
 }
 
 func TestValidateAdditionalPaymentVersions(t *testing.T) {
-	for _, version := range []string{"bca-flazz-top-up-v1", "bca-qris-transfer-v1"} {
+	for _, version := range []string{"bca-flazz-top-up-v1", "bca-qris-transfer-v1", "bca-virtual-account-v1"} {
 		e := Event{SourceJobID: "00000000-0000-4000-8000-000000000001", SourceMessageID: "test", Receipt: bca.Receipt{
 			ParserVersion: version, BankReference: "REF1234", ReceiptKind: "bca_payment", Status: "successful", Currency: "IDR",
 			Amount: "42000.00", SourceAccountAlias: "Tahapan - 1234****56", PaymentTo: "Example Recipient",
 			TransactionDateLocal: "2026-10-03T09:10:11", Timezone: "Asia/Jakarta",
 		}}
+		if version == "bca-virtual-account-v1" {
+			fee := "1000.00"
+			e.Fee = &fee
+		}
 		if _, _, _, err := Validate(e); err != nil {
 			t.Fatalf("%s: %v", version, err)
 		}

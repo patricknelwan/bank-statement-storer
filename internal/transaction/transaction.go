@@ -46,7 +46,7 @@ func Validate(e Event) (int64, *int64, time.Time, error) {
 		e.Status != "successful" || e.Currency != "IDR" || e.Timezone != "Asia/Jakarta" ||
 		e.SourceAccountAlias == "" || len(e.SourceAccountAlias) > 80 || e.BeneficiaryAccount != "" ||
 		(e.ReceiptKind == "bca_transfer" && e.ParserVersion != "bca-account-v1") || (e.ReceiptKind == "interbank_transfer" && e.ParserVersion != "bca-interbank-v1") ||
-		(e.ReceiptKind == "bca_payment" && (e.ParserVersion != "bca-qris-payment-v1" && e.ParserVersion != "bca-flazz-top-up-v1" && e.ParserVersion != "bca-qris-transfer-v1" || e.PaymentTo == "" || len(e.PaymentTo) > 200 || e.BeneficiaryBank != "" || e.BeneficiaryAccountMasked != "" || e.BeneficiaryMatchToken != "")) ||
+		(e.ReceiptKind == "bca_payment" && (e.ParserVersion != "bca-qris-payment-v1" && e.ParserVersion != "bca-flazz-top-up-v1" && e.ParserVersion != "bca-qris-transfer-v1" && e.ParserVersion != "bca-virtual-account-v1" || e.PaymentTo == "" || len(e.PaymentTo) > 200 || e.BeneficiaryBank != "" || e.BeneficiaryAccountMasked != "" || e.BeneficiaryMatchToken != "")) ||
 		(e.ReceiptKind != "bca_payment" && (e.PaymentTo != "" || !strings.Contains(e.BeneficiaryAccountMasked, "*"))) {
 		return 0, nil, time.Time{}, Error{"invalid_event", 422}
 	}

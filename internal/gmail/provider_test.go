@@ -9,6 +9,7 @@ import (
 	"google.golang.org/api/option"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -102,5 +103,41 @@ func TestInspectUnsupportedChecksSender(t *testing.T) {
 	d, err = worker.Inspect(context.Background(), "integration", "message")
 	if err != nil || d.ReasonCode != "sender_changed" || fullCalls != 1 {
 		t.Fatalf("sender gate failed: %+v err=%v full=%d", d, err, fullCalls)
+	}
+}
+
+func TestFindSourceUsesOnlyGmailHeaders(t *testing.T) {
+	from := "BCA <bca@bca.co.id>"
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("format") != "metadata" || r.URL.Query().Get("fields") != "id,payload/headers" {
+			t.Errorf("unexpected source request: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		headers := r.URL.Query()["metadataHeaders"]
+		if len(headers) == 1 && headers[0] == "From" {
+			fmt.Fprintf(w, `{"payload":{"headers":[{"name":"From","value":%q}]}}`, from)
+			return
+		}
+		if strings.Join(headers, ",") != "From,Subject,Date,Message-ID" {
+			t.Errorf("unexpected metadata headers: %v", headers)
+		}
+		fmt.Fprintf(w, `{"payload":{"headers":[{"name":"From","value":%q},{"name":"Subject","value":"Internet Transaction Journal"},{"name":"Date","value":"Fri, 11 Sep 2026 21:07:59 +0700"},{"name":"Message-ID","value":"<receipt.123@bca.co.id>"}]}}`, from)
+	}))
+	defer server.Close()
+	api, err := gmailapi.NewService(context.Background(), option.WithEndpoint(server.URL+"/"), option.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := Worker{providerFactory: func(context.Context, string) (*Provider, error) { return &Provider{API: api}, nil }}
+	source, err := worker.FindSource(context.Background(), "integration", "message")
+	if err != nil || source.GmailSearch != "rfc822msgid:receipt.123@bca.co.id" || source.Subject != "Internet Transaction Journal" || requests != 2 {
+		t.Fatalf("source lookup failed: %+v err=%v requests=%d", source, err, requests)
+	}
+	from = "someone@example.com"
+	_, err = worker.FindSource(context.Background(), "integration", "message")
+	if err == nil || requests != 3 {
+		t.Fatalf("sender gate failed: err=%v requests=%d", err, requests)
 	}
 }

@@ -174,6 +174,9 @@ func ParseWithSubject(body []byte, subject string) (Receipt, string) {
 		if f["type of transaction"] != "" {
 			return Receipt{}, "unsupported"
 		}
+		if strings.EqualFold(f["transfer type"], "Transfer to BCA Virtual Account") {
+			return parseVirtualAccount(f)
+		}
 	}
 	kind := "bca_transfer"
 	if strings.Contains(strings.ToLower(f["transfer type"]), "interbank") || f["beneficiary bank"] != "" {
@@ -293,7 +296,7 @@ func Diagnose(body []byte, subject string) Diagnostic {
 	if d.TransactionType == "" {
 		d.TransactionType = preview(f["type of transaction"])
 	}
-	for _, name := range []string{"status", "transaction type", "type of transaction", "transfer type", "transaction date", "payment to", "source of fund", "total payment", "top up amount", "flazz card number", "transfer amount", "amount", "beneficiary account", "beneficiary bank", "beneficiary name", "beneficiary pan", "acquirer", "reference no."} {
+	for _, name := range []string{"status", "transaction type", "type of transaction", "transfer type", "transaction date", "payment to", "source of fund", "total payment", "pay amount", "admin fee", "bca virtual account no.", "name", "company/product name", "top up amount", "flazz card number", "transfer amount", "amount", "beneficiary account", "beneficiary bank", "beneficiary name", "beneficiary pan", "acquirer", "reference no."} {
 		if f[name] != "" {
 			d.DetectedFields = append(d.DetectedFields, name)
 		}
@@ -325,6 +328,31 @@ func maskSource(source string) string {
 
 func parseQRISPayment(f map[string]string) (Receipt, string) {
 	return parseJournalPayment(f, "total payment", f["payment to"], "bca-qris-payment-v1")
+}
+
+func parseVirtualAccount(f map[string]string) (Receipt, string) {
+	account := strings.NewReplacer(" ", "", "-", "").Replace(f["bca virtual account no."])
+	if len(account) < 10 || len(account) > 25 || f["name"] == "" {
+		return Receipt{}, "needs_review"
+	}
+	for _, r := range account {
+		if r < '0' || r > '9' {
+			return Receipt{}, "needs_review"
+		}
+	}
+	pay, payErr := Money(f["pay amount"])
+	fee, feeErr := Money(f["admin fee"])
+	total, totalErr := Money(f["total payment"])
+	if payErr != nil || feeErr != nil || totalErr != nil || pay <= 0 || fee > math.MaxInt64-pay || pay+fee != total {
+		return Receipt{}, "needs_review"
+	}
+	receipt, outcome := parseJournalPayment(f, "pay amount", f["company/product name"], "bca-virtual-account-v1")
+	if outcome != "" {
+		return receipt, outcome
+	}
+	formattedFee := fmt.Sprintf("%d.%02d", fee/100, fee%100)
+	receipt.Fee = &formattedFee
+	return receipt, ""
 }
 
 func digitsOnly(raw string, length int) (string, bool) {

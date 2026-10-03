@@ -405,6 +405,21 @@ func (w *Worker) Inspect(ctx context.Context, integrationID, messageID string) (
 	return bca.Diagnose(message.Body, message.Subject), nil
 }
 
+func (w *Worker) FindSource(ctx context.Context, integrationID, messageID string) (SourceInfo, error) {
+	p, err := w.provider(ctx, integrationID)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	ok, err := AuthorizedSender(ctx, p, messageID)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	if !ok {
+		return SourceInfo{}, errors.New("sender changed")
+	}
+	return p.SourceMetadata(ctx, messageID)
+}
+
 func (w *Worker) process(ctx context.Context, id, integrationID, messageID string, payload []byte) error {
 	if payload == nil {
 		p, err := w.provider(ctx, integrationID)

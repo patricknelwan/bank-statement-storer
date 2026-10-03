@@ -26,6 +26,12 @@ type FullMessage struct {
 	Verified bool
 }
 
+type SourceInfo struct {
+	Subject     string `json:"subject"`
+	Date        string `json:"date"`
+	GmailSearch string `json:"gmail_search"`
+}
+
 type Provider struct{ API *gmail.Service }
 
 func NewProvider(ctx context.Context, client *http.Client) (*Provider, error) {
@@ -61,6 +67,44 @@ func AuthorizedSender(ctx context.Context, source MessageSource, id string) (boo
 		return false, err
 	}
 	return bca.ExactSender(from), nil
+}
+
+// SourceMetadata reads headers only, after the caller has passed the From-only gate.
+func (p Provider) SourceMetadata(ctx context.Context, id string) (SourceInfo, error) {
+	m, err := p.API.Users.Messages.Get("me", id).Format("metadata").MetadataHeaders("From", "Subject", "Date", "Message-ID").Fields("id,payload/headers").Context(ctx).Do()
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	if m.Payload == nil {
+		return SourceInfo{}, errors.New("empty message metadata")
+	}
+	var from, messageID string
+	info := SourceInfo{}
+	for _, h := range m.Payload.Headers {
+		switch strings.ToLower(h.Name) {
+		case "from":
+			if from != "" {
+				return SourceInfo{}, errors.New("duplicate sender")
+			}
+			from = h.Value
+		case "subject":
+			info.Subject = strings.TrimSpace(h.Value)
+		case "date":
+			info.Date = strings.TrimSpace(h.Value)
+		case "message-id":
+			if messageID != "" {
+				return SourceInfo{}, errors.New("duplicate message-id")
+			}
+			messageID = strings.Trim(strings.TrimSpace(h.Value), "<>")
+		}
+	}
+	if !bca.ExactSender(from) {
+		return SourceInfo{}, errors.New("sender changed")
+	}
+	if len(messageID) > 0 && len(messageID) <= 255 && strings.Count(messageID, "@") == 1 && !strings.ContainsAny(messageID, " \t\r\n<>:") {
+		info.GmailSearch = "rfc822msgid:" + messageID
+	}
+	return info, nil
 }
 
 func (p Provider) Full(ctx context.Context, id string) (FullMessage, error) {

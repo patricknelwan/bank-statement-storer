@@ -102,6 +102,23 @@ func TestJournalTopUpAndQRISTransfer(t *testing.T) {
 	}
 }
 
+func TestVirtualAccountPayment(t *testing.T) {
+	body := fixture(t, "virtual-account.html")
+	r, outcome := ParseWithSubject([]byte(body), "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.ParserVersion != "bca-virtual-account-v1" || r.Amount != "50000.00" || r.Fee == nil || *r.Fee != "1000.00" || r.PaymentTo != "EXAMPLE WALLET / TOP UP" {
+		t.Fatalf("unexpected VA receipt: %+v outcome=%s", r, outcome)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", r), "12345678901234567") {
+		t.Fatal("full virtual account number leaked")
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 51,000.00", "IDR 52,000.00", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("mismatched total: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "12345678901234567", "invalid-account", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid VA: %s", outcome)
+	}
+}
+
 func TestDiagnoseUnsupported(t *testing.T) {
 	body := `<table><tr><td>Status</td><td>Successful</td></tr><tr><td>Transaction Type</td><td>Card Payment</td></tr><tr><td>Total Payment</td><td>IDR 30,000.00</td></tr><tr><td>Payment To</td><td>Private Merchant</td></tr><tr><td>Reference No.</td><td>REF1234</td></tr></table>`
 	d := Diagnose([]byte(body), "Internet Transaction Journal")
