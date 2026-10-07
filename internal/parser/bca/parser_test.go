@@ -114,8 +114,28 @@ func TestVirtualAccountPayment(t *testing.T) {
 	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 51,000.00", "IDR 52,000.00", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
 		t.Fatalf("mismatched total: %s", outcome)
 	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 1,000.00", "invalid", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid explicit fee: %s", outcome)
+	}
 	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "12345678901234567", "invalid-account", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
 		t.Fatalf("invalid VA: %s", outcome)
+	}
+}
+
+func TestVirtualAccountWithoutAdminFee(t *testing.T) {
+	body := strings.Replace(fixture(t, "virtual-account.html"), "<tr><td>Admin Fee</td><td>IDR 1,000.00</td></tr>\n", "", 1)
+	body = strings.Replace(body, "IDR 51,000.00", "IDR 50,000.00", 1)
+	r, outcome := ParseWithSubject([]byte(body), "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.Amount != "50000.00" || r.Fee != nil {
+		t.Fatalf("missing fee: %+v outcome=%s", r, outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 50,000.00</td></tr>\n<tr><td>Reference", "IDR 51,000.00</td></tr>\n<tr><td>Reference", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("missing fee with mismatched total: %s", outcome)
+	}
+	plain := "Status: Successful\nTransaction Date: 06 Oct 2026 08:39:40\nTransfer Type: Transfer to BCA Virtual Account\nSource of Fund: 2180xxxx19\nBCA Virtual Account No.: 3901085177825921\nName: Example Recipient\nCompany/Product Name: EXAMPLE WALLET / TOP UP\nPay Amount: IDR 21,500.00\nTotal Payment: IDR 21,500.00\nReference No.: REF20261006083940"
+	r, outcome = ParseWithSubject([]byte(strings.ReplaceAll(plain, ": ", " \t: \t")), "Internet Transaction Journal")
+	if outcome != "" || r.Amount != "21500.00" || r.Fee != nil || r.TransactionDateLocal != "2026-10-06T08:39:40" {
+		t.Fatalf("plain no-fee receipt: %+v outcome=%s", r, outcome)
 	}
 }
 
