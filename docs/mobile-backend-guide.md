@@ -1,5 +1,8 @@
 # Mobile app backend guide
 
+Browser-cookie sign-in is now a separate implemented flow; see the
+[web backend guide](web-backend-guide.md). The token flow below remains the native/mobile contract.
+
 This guide describes the **implemented** BCA backend contract for a mobile prototype. The endpoint inventory and request validation come from `internal/httpapi/api.go`; authentication comes from `internal/auth/auth.go`; import behavior comes from `internal/gmail/worker.go`. Use [OpenAPI](openapi.yaml) for a machine-readable starting point and the [Postman collection](postman/README.md) for runnable requests. This guide includes response details and workflow behavior that OpenAPI does not yet express.
 
 ## What the service does

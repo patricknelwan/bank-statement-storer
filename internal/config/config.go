@@ -51,6 +51,11 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("%s must be an HTTPS URL or a local/private service HTTP URL", name)
 		}
 	}
+	if origin, err := PublicOrigin(c.PublicURL); err != nil {
+		return c, err
+	} else {
+		c.PublicURL = origin
+	}
 	if c.WorkerToken == c.JWTSecret || c.WorkerToken == c.AccountHMACKey || c.JWTSecret == c.AccountHMACKey {
 		return c, errors.New("security keys must be distinct")
 	}

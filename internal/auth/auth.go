@@ -35,7 +35,10 @@ type Service struct {
 	Verifier *oidc.IDTokenVerifier
 }
 
-type Principal struct{ UserID, SessionID string }
+type Principal struct {
+	UserID, SessionID, Kind, CSRFToken string
+	ExpiresAt                          time.Time
+}
 type ctxKey struct{}
 
 func New(ctx context.Context, db *pgxpool.Pool, c config.Config) (*Service, error) {
@@ -103,15 +106,29 @@ func (s *Service) Decrypt(ciphertext []byte, context string) (string, error) {
 }
 
 func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	publicURL, _ := url.Parse(s.Config.PublicURL)
 	if !strings.EqualFold((&url.URL{Host: r.Host}).Hostname(), publicURL.Hostname()) {
 		http.Redirect(w, r, strings.TrimRight(s.Config.PublicURL, "/")+r.URL.RequestURI(), http.StatusFound)
 		return
 	}
 	client, challenge := r.URL.Query().Get("client"), r.URL.Query().Get("code_challenge")
-	if client != "" && client != "mobile" || client == "mobile" && (s.Config.MobileRedirectURI == "" || !validChallenge(challenge)) || client == "" && challenge != "" {
+	if client != "" && client != "mobile" && client != "web" || client == "mobile" && (s.Config.MobileRedirectURI == "" || !validChallenge(challenge)) || client != "mobile" && challenge != "" {
 		http.Error(w, "invalid client", http.StatusBadRequest)
 		return
+	}
+	mode := "manual"
+	if client != "" {
+		mode = client
+	}
+	var returnPath any
+	if mode == "web" {
+		if _, err := config.PublicOrigin(s.Config.PublicURL); err != nil {
+			http.Error(w, "invalid web origin", 400)
+			return
+		}
+		returnPath = safeReturnPath(r.URL.Query().Get("return_to"))
 	}
 	state, e1 := Random()
 	nonce, e2 := Random()
@@ -124,7 +141,7 @@ func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
 	if client == "mobile" {
 		appChallenge = challenge
 	}
-	_, err := s.DB.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,nonce,pkce_verifier,client_challenge,expires_at) VALUES('oauth',$1,$2,$3,$4,now()+interval '5 minutes')`, Hash(state), nonce, verifier, appChallenge)
+	_, err := s.DB.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,nonce,pkce_verifier,client_challenge,client_type,return_path,expires_at) VALUES('oauth',$1,$2,$3,$4,$5,$6,now()+interval '5 minutes')`, Hash(state), nonce, verifier, appChallenge, mode, returnPath)
 	if err != nil {
 		http.Error(w, "unavailable", 503)
 		return
@@ -134,36 +151,44 @@ func (s *Service) Start(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) Callback(w http.ResponseWriter, r *http.Request) {
+	var mode string
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	cookie, err := r.Cookie("bca_oauth_state")
-	http.SetCookie(w, &http.Cookie{Name: "bca_oauth_state", Path: "/auth/google/callback", MaxAge: -1, HttpOnly: true})
-	if err != nil || r.URL.Query().Get("state") == "" || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(r.URL.Query().Get("state"))) != 1 || r.URL.Query().Get("code") == "" {
-		http.Error(w, "invalid authorization flow", 400)
+	http.SetCookie(w, &http.Cookie{Name: "bca_oauth_state", Path: "/auth/google/callback", MaxAge: -1, HttpOnly: true, Secure: strings.HasPrefix(s.Config.PublicURL, "https://"), SameSite: http.SameSiteLaxMode})
+	if err != nil || r.URL.Query().Get("state") == "" || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(r.URL.Query().Get("state"))) != 1 {
+		oauthFailure(w, r, mode, 400, "invalid authorization flow")
 		return
 	}
 	var nonce, verifier string
 	var clientChallenge *string
-	err = s.DB.QueryRow(r.Context(), `UPDATE auth_flows SET consumed_at=now() WHERE kind='oauth' AND secret_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING nonce,pkce_verifier,client_challenge`, Hash(cookie.Value)).Scan(&nonce, &verifier, &clientChallenge)
+	var returnPath *string
+	err = s.DB.QueryRow(r.Context(), `UPDATE auth_flows SET consumed_at=now() WHERE kind='oauth' AND secret_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING nonce,pkce_verifier,client_challenge,client_type,return_path`, Hash(cookie.Value)).Scan(&nonce, &verifier, &clientChallenge, &mode, &returnPath)
 	if err != nil {
-		http.Error(w, "invalid authorization flow", 400)
+		oauthFailure(w, r, mode, 400, "invalid authorization flow")
 		return
 	}
-	if clientChallenge != nil && s.Config.MobileRedirectURI == "" {
-		http.Error(w, "mobile redirect unavailable", http.StatusServiceUnavailable)
+	if r.URL.Query().Get("error") != "" || r.URL.Query().Get("code") == "" {
+		oauthFailure(w, r, mode, 400, "consent denied")
+		return
+	}
+	if mode == "mobile" && s.Config.MobileRedirectURI == "" {
+		oauthFailure(w, r, mode, http.StatusServiceUnavailable, "mobile redirect unavailable")
 		return
 	}
 	token, err := s.OAuth.Exchange(r.Context(), r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
 	if err != nil {
-		http.Error(w, "authorization failed", 401)
+		oauthFailure(w, r, mode, 401, "authorization failed")
 		return
 	}
 	rawID, ok := token.Extra("id_token").(string)
 	if !ok {
-		http.Error(w, "identity unavailable", 401)
+		oauthFailure(w, r, mode, 401, "identity unavailable")
 		return
 	}
 	id, err := s.Verifier.Verify(r.Context(), rawID)
 	if err != nil {
-		http.Error(w, "identity invalid", 401)
+		oauthFailure(w, r, mode, 401, "identity invalid")
 		return
 	}
 	var claims struct {
@@ -172,61 +197,79 @@ func (s *Service) Callback(w http.ResponseWriter, r *http.Request) {
 		EmailVerified bool   `json:"email_verified"`
 	}
 	if err := id.Claims(&claims); err != nil || claims.Nonce != nonce || !claims.EmailVerified || id.Subject != s.Config.OwnerGoogleSub {
-		http.Error(w, "owner identity rejected", 403)
+		oauthFailure(w, r, mode, 403, "owner identity rejected")
 		return
 	}
 	tx, err := s.DB.Begin(r.Context())
 	if err != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
 		return
 	}
 	defer tx.Rollback(r.Context())
 	var userID, integrationID string
 	err = tx.QueryRow(r.Context(), `INSERT INTO users(google_sub,email) VALUES($1,$2) ON CONFLICT(google_sub) DO UPDATE SET email=EXCLUDED.email RETURNING id`, id.Subject, claims.Email).Scan(&userID)
 	if err != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
 		return
 	}
 	err = tx.QueryRow(r.Context(), `INSERT INTO gmail_integrations(user_id,mailbox_id,status) VALUES($1,$2,'connected') ON CONFLICT(user_id) DO UPDATE SET status='connected' RETURNING id`, userID, id.Subject).Scan(&integrationID)
 	if err != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
 		return
 	}
 	if token.RefreshToken != "" {
 		encrypted, e := s.Encrypt(token.RefreshToken, integrationID)
 		if e != nil {
-			http.Error(w, "unavailable", 503)
+			oauthFailure(w, r, mode, 503, "unavailable")
 			return
 		}
 		_, err = tx.Exec(r.Context(), `UPDATE gmail_integrations SET encrypted_refresh_token=$2 WHERE id=$1`, integrationID, encrypted)
 		if err != nil {
-			http.Error(w, "unavailable", 503)
+			oauthFailure(w, r, mode, 503, "unavailable")
 			return
 		}
 	}
 	var hasToken bool
 	err = tx.QueryRow(r.Context(), `SELECT encrypted_refresh_token IS NOT NULL FROM gmail_integrations WHERE id=$1`, integrationID).Scan(&hasToken)
 	if err != nil || !hasToken {
-		http.Error(w, "offline access unavailable; reconnect with consent", 400)
+		oauthFailure(w, r, mode, 400, "offline access unavailable; reconnect with consent")
 		return
 	}
 	_, err = tx.Exec(r.Context(), `INSERT INTO gmail_sync_state(integration_id,coverage_start) VALUES($1,now()-interval '30 days') ON CONFLICT DO NOTHING`, integrationID)
 	if err != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
+		return
+	}
+	if mode == "web" {
+		secret, expiry, err := s.issueWebSession(r.Context(), tx, userID, r)
+		if err != nil {
+			oauthFailure(w, r, mode, 503, "unavailable")
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			oauthFailure(w, r, mode, 503, "unavailable")
+			return
+		}
+		http.SetCookie(w, s.webCookie(secret, expiry))
+		destination := "/transactions"
+		if returnPath != nil {
+			destination = safeReturnPath(*returnPath)
+		}
+		http.Redirect(w, r, destination, http.StatusSeeOther)
 		return
 	}
 	code, err := Random()
 	if err != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
 		return
 	}
-	_, err = tx.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,user_id,client_challenge,expires_at) VALUES('login_code',$1,$2,$3,now()+interval '60 seconds')`, Hash(code), userID, clientChallenge)
+	_, err = tx.Exec(r.Context(), `INSERT INTO auth_flows(kind,secret_hash,user_id,client_challenge,client_type,expires_at) VALUES('login_code',$1,$2,$3,$4,now()+interval '60 seconds')`, Hash(code), userID, clientChallenge, mode)
 	if err != nil || tx.Commit(r.Context()) != nil {
-		http.Error(w, "unavailable", 503)
+		oauthFailure(w, r, mode, 503, "unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if clientChallenge != nil {
+	if mode == "mobile" {
 		callback, _ := url.Parse(s.Config.MobileRedirectURI)
 		query := callback.Query()
 		query.Set("code", code)
@@ -264,7 +307,7 @@ func (s *Service) issue(ctx context.Context, userID, familyID string, expiry tim
 
 func (s *Service) Exchange(ctx context.Context, code, verifier string) (TokenPair, error) {
 	var userID string
-	err := s.DB.QueryRow(ctx, `UPDATE auth_flows SET consumed_at=now() WHERE kind='login_code' AND secret_hash=$1 AND (client_challenge IS NULL OR client_challenge=$2) AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`, Hash(code), appChallenge(verifier)).Scan(&userID)
+	err := s.DB.QueryRow(ctx, `UPDATE auth_flows SET consumed_at=now() WHERE kind='login_code' AND client_type IN ('manual','mobile') AND secret_hash=$1 AND (client_challenge IS NULL OR client_challenge=$2) AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`, Hash(code), appChallenge(verifier)).Scan(&userID)
 	if err != nil {
 		return TokenPair{}, errors.New("invalid code")
 	}
@@ -311,12 +354,25 @@ func (s *Service) Refresh(ctx context.Context, raw string) (TokenPair, error) {
 }
 
 func (s *Service) Logout(ctx context.Context, p Principal) error {
+	if p.Kind == browserKind {
+		_, err := s.DB.Exec(ctx, `UPDATE web_sessions SET revoked_at=now() WHERE id=$1 AND user_id=$2`, p.SessionID, p.UserID)
+		return err
+	}
 	_, err := s.DB.Exec(ctx, `UPDATE sessions SET revoked_at=now() WHERE family_id=(SELECT family_id FROM sessions WHERE id=$1 AND user_id=$2)`, p.SessionID, p.UserID)
 	return err
 }
 
 func (s *Service) Owner(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie(s.webCookie("", time.Time{}).Name)
+		if err == nil {
+			if r.Header.Get("Authorization") != "" {
+				authFailure(w, r, 400, "ambiguous_credentials")
+				return
+			}
+			s.webOwner(w, r, cookie, next)
+			return
+		}
 		raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if raw == "" || raw == r.Header.Get("Authorization") {
 			reject(w, r)
@@ -340,7 +396,7 @@ func (s *Service) Owner(next http.Handler) http.Handler {
 			reject(w, r)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, Principal{userID, sessionID})))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, Principal{UserID: userID, SessionID: sessionID, Kind: "bearer"})))
 	})
 }
 func FromContext(ctx context.Context) Principal { p, _ := ctx.Value(ctxKey{}).(Principal); return p }
@@ -357,6 +413,7 @@ func (s *Service) Worker(next http.Handler) http.Handler {
 }
 
 func reject(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(401)
 	_ = json.NewEncoder(w).Encode(map[string]string{"code": "unauthorized", "request_id": middleware.GetReqID(r.Context())})

@@ -26,9 +26,10 @@ paths:
   /auth/google/start:
     get:
       operationId: googleStart
-      description: Open in a browser. Sets a short-lived state cookie and redirects to Google consent. For mobile, supply client=mobile and an S256 code_challenge; the server must have MOBILE_REDIRECT_URI configured.
+      description: Open in a browser. Sets a short-lived state cookie and redirects to Google consent. For mobile, supply client=mobile and an S256 code_challenge; the server must have MOBILE_REDIRECT_URI configured. For the web app, use client=web with an optional allowlisted return_to pathname; the backend issues an HttpOnly cookie after consent.
       parameters:
-        - {name: client, in: query, schema: {type: string, enum: [mobile]}, description: Omit for manual browser code display}
+        - {name: client, in: query, schema: {type: string, enum: [mobile, web]}, description: Omit for manual browser code display}
+        - {name: return_to, in: query, schema: {type: string}, description: Web-only allowlisted internal pathname; defaults to /transactions}
         - {name: code_challenge, in: query, schema: {type: string, minLength: 43, maxLength: 43}, description: Base64url SHA-256 of the app's code verifier; required for mobile}
       responses:
         '302': {description: Google authorization redirect}
@@ -39,10 +40,11 @@ paths:
       description: Google redirects here; a successful manual flow shows a one-time application login code in HTML, while a mobile flow redirects to the configured app URI with the code in its query.
       parameters:
         - {name: state, in: query, required: true, schema: {type: string}}
-        - {name: code, in: query, required: true, schema: {type: string}}
+        - {name: code, in: query, required: false, schema: {type: string}}
       responses:
         '200': {description: One-time code in HTML}
         '302': {description: Mobile flow redirects to configured app URI with one-time code}
+        '303': {description: "Web flow sets browser session cookie and redirects to the allowed app path, or a safe sign-in error"}
         '400': {description: Invalid or expired authorization state}
         '403': {description: Google subject is not the configured owner}
   /api/v1/auth/exchange:
@@ -68,17 +70,26 @@ paths:
       responses:
         '200': {description: Rotated application tokens, content: {application/json: {schema: {$ref: '#/components/schemas/TokenPair'}}}}
         '401': {description: Invalid or reused refresh token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /api/v1/auth/session:
+    get:
+      operationId: browserSession
+      description: Cookie authentication only. Returns owner profile, CSRF token and absolute expiry; never a bearer pair. Local HTTP loopback uses statement_session instead of the production cookie name.
+      security: [{browserCookie: []}]
+      responses:
+        '200': {description: Browser session bootstrap, content: {application/json: {schema: {$ref: '#/components/schemas/BrowserSession'}}}}
+        '401': {description: No active browser session}
+        '503': {description: Session database unavailable}
   /api/v1/auth/logout:
     post:
       operationId: logout
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       responses:
-        '204': {description: Session family revoked}
+        '204': {description: "Browser session revoked and cookie expired, or bearer session family revoked"}
         '401': {description: Unauthorized}
   /api/v1/me:
     get:
       operationId: me
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       responses:
         '200':
           description: Owner profile
@@ -94,26 +105,26 @@ paths:
   /api/v1/integrations/gmail:
     get:
       operationId: gmailStatus
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       responses:
         '200': {description: Connection status and last successful discovery, content: {application/json: {schema: {$ref: '#/components/schemas/GmailIntegration'}}}}
     delete:
       operationId: gmailDisconnect
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       responses:
         '204': {description: Credentials removed; transactions retained}
         '404': {description: Integration missing}
   /api/v1/integrations/gmail/sync:
     post:
       operationId: gmailSync
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       responses:
         '202': {description: Discovery scheduled, content: {application/json: {schema: {type: object, properties: {operation_id: {type: string, format: uuid}, status: {type: string}}}}}}
         '409': {description: Integration unavailable}
   /api/v1/integrations/gmail/sync/{id}:
     get:
       operationId: gmailSyncOutcome
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '200':
@@ -132,7 +143,7 @@ paths:
   /api/v1/imports:
     get:
       operationId: listImports
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
@@ -142,7 +153,7 @@ paths:
   /api/v1/imports/{id}:
     get:
       operationId: getImport
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '200': {description: Safe import outcome, content: {application/json: {schema: {$ref: '#/components/schemas/ImportDetail'}}}}
@@ -151,7 +162,7 @@ paths:
     get:
       operationId: findImportSource
       description: Owner-only metadata lookup. Fetches the From header first, then subject, date and Message-ID for an exact BCA sender. No message body is fetched. Paste gmail_search into Gmail to open the email.
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '200':
@@ -172,7 +183,7 @@ paths:
     get:
       operationId: inspectUnsupportedImport
       description: Owner-only on-demand inspection of one unsupported job. Refetches the BCA email after sender and receiver-authentication checks, returns bounded layout clues, and does not store the message or change the job.
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '200':
@@ -201,7 +212,7 @@ paths:
   /api/v1/imports/{id}/retry:
     post:
       operationId: retryImport
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '202': {description: Retry queued, content: {application/json: {schema: {type: object, required: [id, state], properties: {id: {type: string, format: uuid}, state: {type: string, enum: [queued]}}}}}}
@@ -225,7 +236,7 @@ paths:
   /api/v1/transactions:
     get:
       operationId: listTransactions
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
@@ -239,14 +250,14 @@ paths:
   /api/v1/transactions/{id}:
     get:
       operationId: getTransaction
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       responses:
         '200': {description: Transaction, content: {application/json: {schema: {$ref: '#/components/schemas/Transaction'}}}}
         '404': {description: Transaction not found}
     patch:
       operationId: updateTransaction
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       parameters: [{$ref: '#/components/parameters/ID'}]
       requestBody:
         required: true
@@ -266,12 +277,12 @@ paths:
   /api/v1/owned-accounts:
     get:
       operationId: listOwnedAccounts
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: []}]
       responses:
         '200': {description: Masked owned accounts, content: {application/json: {schema: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/OwnedAccount'}}}}}}}
     post:
       operationId: addOwnedAccount
-      security: [{ownerBearer: []}]
+      security: [{ownerBearer: []}, {browserCookie: [], browserCSRF: []}]
       requestBody:
         required: true
         content:
@@ -290,6 +301,8 @@ components:
   securitySchemes:
     ownerBearer: {type: http, scheme: bearer, bearerFormat: JWT}
     workerBearer: {type: http, scheme: bearer}
+    browserCookie: {type: apiKey, in: cookie, name: __Host-statement_session, description: Secure HttpOnly SameSite=Lax cookie. Loopback HTTP uses statement_session. Cannot be combined with Authorization.}
+    browserCSRF: {type: apiKey, in: header, name: X-CSRF-Token, description: Cookie mutations require the session CSRF token AND exact configured Origin. Browsers send Origin automatically.}
   parameters:
     ID: {name: id, in: path, required: true, schema: {type: string, format: uuid}}
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
@@ -301,6 +314,19 @@ components:
       properties:
         code: {type: string}
         request_id: {type: string}
+    BrowserSession:
+      type: object
+      required: [user, csrf_token, expires_at]
+      properties:
+        user:
+          type: object
+          required: [id, email, timezone]
+          properties:
+            id: {type: string, format: uuid}
+            email: {type: string, format: email}
+            timezone: {type: string}
+        csrf_token: {type: string}
+        expires_at: {type: string, format: date-time}
     TokenPair:
       type: object
       required: [access_token, refresh_token, expires_in]
