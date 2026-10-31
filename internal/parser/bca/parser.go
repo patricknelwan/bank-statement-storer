@@ -341,17 +341,26 @@ func parseVirtualAccount(f map[string]string) (Receipt, string) {
 		}
 	}
 	pay, payErr := Money(f["pay amount"])
-	fee, feeErr := Money(f["admin fee"])
 	total, totalErr := Money(f["total payment"])
-	if payErr != nil || feeErr != nil || totalErr != nil || pay <= 0 || fee > math.MaxInt64-pay || pay+fee != total {
+	feeMinor := int64(0)
+	var fee *string
+	if raw := f["admin fee"]; raw != "" {
+		var err error
+		feeMinor, err = Money(raw)
+		if err != nil {
+			return Receipt{}, "needs_review"
+		}
+		formatted := fmt.Sprintf("%d.%02d", feeMinor/100, feeMinor%100)
+		fee = &formatted
+	}
+	if payErr != nil || totalErr != nil || pay <= 0 || feeMinor > math.MaxInt64-pay || pay+feeMinor != total {
 		return Receipt{}, "needs_review"
 	}
 	receipt, outcome := parseJournalPayment(f, "pay amount", f["company/product name"], "bca-virtual-account-v1")
 	if outcome != "" {
 		return receipt, outcome
 	}
-	formattedFee := fmt.Sprintf("%d.%02d", fee/100, fee%100)
-	receipt.Fee = &formattedFee
+	receipt.Fee = fee
 	return receipt, ""
 }
 

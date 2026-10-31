@@ -74,6 +74,12 @@ func decode(r *http.Request, v any) error {
 func (a API) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.Recoverer)
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			next.ServeHTTP(w, r)
+		})
+	})
 	r.Get("/health/live", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, 200, map[string]string{"status": "live"}) })
 	r.Get("/health/ready", func(w http.ResponseWriter, r *http.Request) {
 		ready, err := database.New(a.DB).DatabaseReady(r.Context())
@@ -95,6 +101,7 @@ func (a API) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(a.Auth.Owner)
 		r.Post("/api/v1/auth/logout", a.logout)
+		r.Get("/api/v1/auth/session", a.Auth.BrowserSession)
 		r.Get("/api/v1/me", a.me)
 		r.Get("/api/v1/integrations/gmail", a.integration)
 		r.Delete("/api/v1/integrations/gmail", a.disconnect)
@@ -149,6 +156,7 @@ func (a API) logout(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "unavailable")
 		return
 	}
+	a.Auth.ClearBrowserSessionCookie(w, r)
 	w.WriteHeader(204)
 }
 func (a API) me(w http.ResponseWriter, r *http.Request) {

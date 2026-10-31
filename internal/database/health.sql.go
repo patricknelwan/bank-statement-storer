@@ -21,7 +21,10 @@ func (q *Queries) CountPendingJobs(ctx context.Context) (int64, error) {
 }
 
 const databaseReady = `-- name: DatabaseReady :one
-SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='gmail_sync_operations' AND n.nspname='public' AND c.relkind='r') AS ready
+SELECT EXISTS(SELECT 1 FROM information_schema.columns
+ WHERE table_schema='public' AND table_name='auth_flows' AND column_name='client_type'
+ AND to_regclass('public.gmail_sync_operations') IS NOT NULL
+ AND to_regclass('public.web_sessions') IS NOT NULL) AS ready
 `
 
 func (q *Queries) DatabaseReady(ctx context.Context) (bool, error) {
