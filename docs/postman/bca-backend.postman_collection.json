@@ -206,7 +206,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
-                  "pm.expect(pm.response.json().items).to.be.an(\"array\");"
+                  "const items=pm.response.json().items; pm.expect(items).to.be.an(\"array\"); if(items.length){pm.expect(items[0]).to.have.all.keys(\"id\",\"state\",\"reason_code\",\"attempts\",\"created_at\",\"transaction_id\");}"
                 ]
               }
             }
@@ -232,7 +232,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
-                  "pm.expect(pm.response.json().id).to.equal(pm.environment.get(\"account_job_id\"));"
+                  "const job=pm.response.json(); pm.expect(job.id).to.equal(pm.environment.get(\"account_job_id\")); pm.expect(job).to.have.property(\"transaction_id\");"
                 ]
               }
             }
@@ -1133,26 +1133,6 @@
       "name": "Manual Only",
       "item": [
         {
-          "name": "Open Google consent in browser",
-          "request": {
-            "method": "GET",
-            "header": [],
-            "url": "{{base_url}}/auth/google/start"
-          },
-          "response": [],
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test(\"HTTP 302\", () => pm.response.to.have.status(302));"
-                ]
-              }
-            }
-          ]
-        },
-        {
           "name": "Request immediate Gmail sync",
           "request": {
             "method": "POST",
@@ -1230,7 +1210,7 @@
           ]
         },
         {
-          "name": "Retry eligible failed import",
+          "name": "Retry review or unsupported import",
           "request": {
             "method": "POST",
             "header": [
@@ -1253,6 +1233,62 @@
               }
             }
           ]
+        },
+        {
+          "name": "Get import outcome",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports/{{import_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Find source email in Gmail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports/{{import_id}}/source"
+          },
+          "response": []
+        },
+        {
+          "name": "List unsupported imports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports?state=unsupported&limit=100"
+          },
+          "response": []
+        },
+        {
+          "name": "Inspect unsupported import",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/imports/{{import_id}}/inspect"
+          },
+          "response": []
         }
       ]
     }

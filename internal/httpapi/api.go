@@ -74,6 +74,12 @@ func decode(r *http.Request, v any) error {
 func (a API) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.Recoverer)
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			next.ServeHTTP(w, r)
+		})
+	})
 	r.Get("/health/live", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, 200, map[string]string{"status": "live"}) })
 	r.Get("/health/ready", func(w http.ResponseWriter, r *http.Request) {
 		ready, err := database.New(a.DB).DatabaseReady(r.Context())
@@ -95,6 +101,7 @@ func (a API) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(a.Auth.Owner)
 		r.Post("/api/v1/auth/logout", a.logout)
+		r.Get("/api/v1/auth/session", a.Auth.BrowserSession)
 		r.Get("/api/v1/me", a.me)
 		r.Get("/api/v1/integrations/gmail", a.integration)
 		r.Delete("/api/v1/integrations/gmail", a.disconnect)
@@ -102,6 +109,8 @@ func (a API) Router() http.Handler {
 		r.Get("/api/v1/integrations/gmail/sync/{id}", a.syncOperation)
 		r.Get("/api/v1/imports", a.imports)
 		r.Get("/api/v1/imports/{id}", a.importDetail)
+		r.With(throttle(controlRate)).Get("/api/v1/imports/{id}/source", a.importSource)
+		r.With(throttle(controlRate)).Get("/api/v1/imports/{id}/inspect", a.inspectImport)
 		r.With(throttle(controlRate)).Post("/api/v1/imports/{id}/retry", a.retry)
 		r.Get("/api/v1/transactions", a.transactions)
 		r.Get("/api/v1/transactions/{id}", a.transactionDetail)
@@ -113,13 +122,14 @@ func (a API) Router() http.Handler {
 }
 func (a API) exchange(w http.ResponseWriter, r *http.Request) {
 	var q struct {
-		Code string `json:"code"`
+		Code         string `json:"code"`
+		CodeVerifier string `json:"code_verifier"`
 	}
 	if decode(r, &q) != nil || q.Code == "" {
 		fail(w, r, 422, "invalid_code")
 		return
 	}
-	pair, err := a.Auth.Exchange(r.Context(), q.Code)
+	pair, err := a.Auth.Exchange(r.Context(), q.Code, q.CodeVerifier)
 	if err != nil {
 		fail(w, r, 401, "invalid_code")
 		return
@@ -146,6 +156,7 @@ func (a API) logout(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "unavailable")
 		return
 	}
+	a.Auth.ClearBrowserSessionCookie(w, r)
 	w.WriteHeader(204)
 }
 func (a API) me(w http.ResponseWriter, r *http.Request) {
@@ -299,26 +310,36 @@ func (a API) imports(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 422, "invalid_page")
 		return
 	}
-	rows, err := a.DB.Query(r.Context(), `SELECT j.id,j.state,j.reason_code,j.attempts,j.created_at
+	state := r.URL.Query().Get("state")
+	switch state {
+	case "", "queued", "processing", "retry_wait", "completed", "ignored", "unsupported", "needs_review", "failed":
+	default:
+		fail(w, r, 422, "invalid_state")
+		return
+	}
+	rows, err := a.DB.Query(r.Context(), `SELECT j.id,j.state,j.reason_code,j.attempts,j.created_at,ts.transaction_id
 		FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id
-		WHERE i.user_id=$1 AND ($2::timestamptz IS NULL OR (j.created_at,j.id)<($2,$3::uuid))
-		ORDER BY j.created_at DESC,j.id DESC LIMIT $4`, auth.FromContext(r.Context()).UserID, nullableTime(c.At), nullableID(c.ID), limit+1)
+		LEFT JOIN transaction_sources ts ON ts.job_id=j.id
+		WHERE i.user_id=$1 AND ($2='' OR j.state=$2) AND ($3::timestamptz IS NULL OR (j.created_at,j.id)<($3,$4::uuid))
+		ORDER BY j.created_at DESC,j.id DESC LIMIT $5`, auth.FromContext(r.Context()).UserID, state, nullableTime(c.At), nullableID(c.ID), limit+1)
 	if err != nil {
 		fail(w, r, 503, "unavailable")
 		return
 	}
 	defer rows.Close()
 	type item struct {
-		ID, State  string
-		ReasonCode *string   `json:"reason_code"`
-		Attempts   int       `json:"attempts"`
-		CreatedAt  time.Time `json:"created_at"`
+		ID            string    `json:"id"`
+		State         string    `json:"state"`
+		ReasonCode    *string   `json:"reason_code"`
+		Attempts      int       `json:"attempts"`
+		CreatedAt     time.Time `json:"created_at"`
+		TransactionID *string   `json:"transaction_id"`
 	}
 	items := []item{}
 	next := ""
 	for rows.Next() {
 		var x item
-		if rows.Scan(&x.ID, &x.State, &x.ReasonCode, &x.Attempts, &x.CreatedAt) != nil {
+		if rows.Scan(&x.ID, &x.State, &x.ReasonCode, &x.Attempts, &x.CreatedAt, &x.TransactionID) != nil {
 			fail(w, r, 503, "unavailable")
 			return
 		}
@@ -354,10 +375,10 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var state string
-	var reason *string
+	var reason, transactionID *string
 	var attempts int
 	var created, updated time.Time
-	err := a.DB.QueryRow(r.Context(), `SELECT j.state,j.reason_code,j.attempts,j.created_at,j.updated_at FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&state, &reason, &attempts, &created, &updated)
+	err := a.DB.QueryRow(r.Context(), `SELECT j.state,j.reason_code,j.attempts,j.created_at,j.updated_at,ts.transaction_id FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id LEFT JOIN transaction_sources ts ON ts.job_id=j.id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&state, &reason, &attempts, &created, &updated, &transactionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fail(w, r, 404, "import_not_found")
 		return
@@ -366,7 +387,61 @@ func (a API) importDetail(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "unavailable")
 		return
 	}
-	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated})
+	jsonOut(w, 200, map[string]any{"id": id, "state": state, "reason_code": reason, "attempts": attempts, "created_at": created, "updated_at": updated, "transaction_id": transactionID})
+}
+
+func (a API) importSource(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var integrationID, messageID string
+	err := a.DB.QueryRow(r.Context(), `SELECT j.integration_id,j.message_id FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&integrationID, &messageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fail(w, r, 404, "import_not_found")
+		return
+	}
+	if err != nil {
+		fail(w, r, 503, "unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	source, err := a.Worker.FindSource(ctx, integrationID, messageID)
+	if err != nil {
+		fail(w, r, 503, "source_unavailable")
+		return
+	}
+	jsonOut(w, 200, map[string]string{"id": id, "subject": source.Subject, "date": source.Date, "gmail_search": source.GmailSearch})
+}
+
+func (a API) inspectImport(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var integrationID, messageID, state string
+	err := a.DB.QueryRow(r.Context(), `SELECT j.integration_id,j.message_id,j.state FROM bca_email_jobs j JOIN gmail_integrations i ON i.id=j.integration_id WHERE j.id=$1 AND i.user_id=$2`, id, auth.FromContext(r.Context()).UserID).Scan(&integrationID, &messageID, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fail(w, r, 404, "import_not_found")
+		return
+	}
+	if err != nil {
+		fail(w, r, 503, "unavailable")
+		return
+	}
+	if state != "unsupported" {
+		fail(w, r, 409, "import_not_unsupported")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	diagnostic, err := a.Worker.Inspect(ctx, integrationID, messageID)
+	if err != nil {
+		fail(w, r, 503, "inspection_unavailable")
+		return
+	}
+	jsonOut(w, 200, map[string]any{"id": id, "job_state": state, "diagnostic": diagnostic})
 }
 func (a API) retry(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
@@ -374,7 +449,7 @@ func (a API) retry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := a.DB.Exec(r.Context(), `UPDATE bca_email_jobs j SET state='queued',attempts=0,next_attempt_at=now(),lease_until=NULL,reason_code=NULL,updated_at=now()
-		FROM gmail_integrations i WHERE j.integration_id=i.id AND j.id=$1 AND i.user_id=$2 AND i.status='connected' AND j.state IN ('failed','needs_review')`, id, auth.FromContext(r.Context()).UserID)
+		FROM gmail_integrations i WHERE j.integration_id=i.id AND j.id=$1 AND i.user_id=$2 AND i.status='connected' AND j.state IN ('failed','needs_review','unsupported')`, id, auth.FromContext(r.Context()).UserID)
 	if err != nil {
 		fail(w, r, 503, "unavailable")
 		return
@@ -398,6 +473,7 @@ type transactionDTO struct {
 	SourceAccountAlias       string    `json:"source_account_alias"`
 	BeneficiaryBank          string    `json:"beneficiary_bank"`
 	BeneficiaryAccountMasked string    `json:"beneficiary_account_masked"`
+	PaymentTo                string    `json:"payment_to,omitempty"`
 	Note                     string    `json:"note"`
 	Version                  int       `json:"version"`
 	CreatedAt                time.Time `json:"created_at"`
@@ -407,7 +483,7 @@ func scanTransaction(row pgx.Row) (transactionDTO, error) {
 	var t transactionDTO
 	var amount int64
 	var fee *int64
-	err := row.Scan(&t.ID, &t.BankReference, &t.ReceiptKind, &t.Classification, &t.OccurredAt, &amount, &fee, &t.Currency, &t.SourceAccountAlias, &t.BeneficiaryBank, &t.BeneficiaryAccountMasked, &t.Note, &t.Version, &t.CreatedAt)
+	err := row.Scan(&t.ID, &t.BankReference, &t.ReceiptKind, &t.Classification, &t.OccurredAt, &amount, &fee, &t.Currency, &t.SourceAccountAlias, &t.BeneficiaryBank, &t.BeneficiaryAccountMasked, &t.PaymentTo, &t.Note, &t.Version, &t.CreatedAt)
 	if err != nil {
 		return t, err
 	}
@@ -419,7 +495,7 @@ func scanTransaction(row pgx.Row) (transactionDTO, error) {
 	return t, nil
 }
 
-const transactionColumns = `t.id,t.bank_reference,t.receipt_kind,t.classification,t.occurred_at,t.amount_minor,t.fee_minor,t.currency,t.source_account_alias,coalesce(t.beneficiary_bank,''),t.beneficiary_account_masked,t.note,t.version,t.created_at`
+const transactionColumns = `t.id,t.bank_reference,t.receipt_kind,t.classification,t.occurred_at,t.amount_minor,t.fee_minor,t.currency,t.source_account_alias,coalesce(t.beneficiary_bank,''),t.beneficiary_account_masked,t.payment_to,t.note,t.version,t.created_at`
 
 func (a API) transactions(w http.ResponseWriter, r *http.Request) {
 	limit, c, err := page(r)
@@ -442,8 +518,8 @@ func (a API) transactions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows, err := a.DB.Query(r.Context(), `SELECT `+transactionColumns+` FROM transactions t WHERE t.user_id=$1
-		AND ($2='' OR t.classification=$2) AND ($3::date IS NULL OR t.occurred_at >= $3::date)
-		AND ($4::date IS NULL OR t.occurred_at < ($4::date+interval '1 day'))
+		AND ($2='' OR t.classification=$2) AND ($3::date IS NULL OR t.occurred_at >= ($3::date::timestamp AT TIME ZONE 'Asia/Jakarta'))
+		AND ($4::date IS NULL OR t.occurred_at < (($4::date+1)::timestamp AT TIME ZONE 'Asia/Jakarta'))
 		AND ($5='' OR t.beneficiary_bank=$5) AND ($6='' OR t.source_account_alias=$6)
 		AND ($7::timestamptz IS NULL OR (t.created_at,t.id)<($7,$8::uuid))
 		ORDER BY t.created_at DESC,t.id DESC LIMIT $9`,

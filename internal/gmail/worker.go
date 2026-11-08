@@ -375,6 +375,51 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 func (w *Worker) outcome(ctx context.Context, id, state, reason string) {
 	_, _ = w.DB.Exec(ctx, `UPDATE bca_email_jobs SET state=$2,reason_code=$3,lease_until=NULL,updated_at=now() WHERE id=$1`, id, state, reason)
 }
+
+// Inspect refetches one selected message without changing its job or storing its body.
+func (w *Worker) Inspect(ctx context.Context, integrationID, messageID string) (bca.Diagnostic, error) {
+	p, err := w.provider(ctx, integrationID)
+	if err != nil {
+		return bca.Diagnostic{}, err
+	}
+	ok, err := AuthorizedSender(ctx, p, messageID)
+	if isGone(err) {
+		return bca.Diagnostic{ParserOutcome: "not_checked", ReasonCode: "missing_source", DetectedFields: []string{}}, nil
+	}
+	if err != nil {
+		return bca.Diagnostic{}, err
+	}
+	if !ok {
+		return bca.Diagnostic{ParserOutcome: "not_checked", ReasonCode: "sender_changed", DetectedFields: []string{}}, nil
+	}
+	message, err := p.Full(ctx, messageID)
+	if isGone(err) {
+		return bca.Diagnostic{ParserOutcome: "not_checked", ReasonCode: "missing_source", DetectedFields: []string{}}, nil
+	}
+	if err != nil {
+		return bca.Diagnostic{}, err
+	}
+	if !w.Config.TrustGmailAuthResults || !message.Verified {
+		return bca.Diagnostic{ParserOutcome: "not_checked", ReasonCode: "authentication_unverified", DetectedFields: []string{}}, nil
+	}
+	return bca.Diagnose(message.Body, message.Subject), nil
+}
+
+func (w *Worker) FindSource(ctx context.Context, integrationID, messageID string) (SourceInfo, error) {
+	p, err := w.provider(ctx, integrationID)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	ok, err := AuthorizedSender(ctx, p, messageID)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	if !ok {
+		return SourceInfo{}, errors.New("sender changed")
+	}
+	return p.SourceMetadata(ctx, messageID)
+}
+
 func (w *Worker) process(ctx context.Context, id, integrationID, messageID string, payload []byte) error {
 	if payload == nil {
 		p, err := w.provider(ctx, integrationID)
@@ -389,28 +434,35 @@ func (w *Worker) process(ctx context.Context, id, integrationID, messageID strin
 			w.outcome(ctx, id, "needs_review", "sender_changed")
 			return nil
 		}
-		body, verified, err := p.Full(ctx, messageID)
+		message, err := p.Full(ctx, messageID)
 		if err != nil {
 			return err
 		}
-		if !w.Config.TrustGmailAuthResults || !verified {
+		if !w.Config.TrustGmailAuthResults || !message.Verified {
 			w.outcome(ctx, id, "needs_review", "authentication_unverified")
 			return nil
 		}
-		receipt, outcome := bca.Parse(body)
+		receipt, outcome := bca.ParseWithSubject(message.Body, message.Subject)
 		if outcome != "" {
-			w.outcome(ctx, id, outcome, "parser_"+outcome)
+			reason := "parser_" + outcome
+			if outcome == "unsupported" {
+				reason = bca.Diagnose(message.Body, message.Subject).ReasonCode
+			}
+			w.outcome(ctx, id, outcome, reason)
 			return nil
 		}
-		h := hmac.New(sha256.New, []byte(w.Config.AccountHMACKey))
-		h.Write([]byte(strings.ToUpper(receipt.BeneficiaryBank) + "\x00" + receipt.BeneficiaryAccount))
-		event := transaction.Event{SourceJobID: id, SourceMessageID: messageID, Receipt: receipt, BeneficiaryMatchToken: hex.EncodeToString(h.Sum(nil))}
+		event := transaction.Event{SourceJobID: id, SourceMessageID: messageID, Receipt: receipt}
+		if receipt.BeneficiaryAccount != "" {
+			h := hmac.New(sha256.New, []byte(w.Config.AccountHMACKey))
+			h.Write([]byte(strings.ToUpper(receipt.BeneficiaryBank) + "\x00" + receipt.BeneficiaryAccount))
+			event.BeneficiaryMatchToken = hex.EncodeToString(h.Sum(nil))
+		}
 		event.BeneficiaryAccount = ""
 		payload, err = json.Marshal(event)
 		if err != nil {
 			return err
 		}
-		ciphertext, err := w.Auth.Encrypt(string(body), id)
+		ciphertext, err := w.Auth.Encrypt(string(message.Body), id)
 		if err != nil {
 			return err
 		}

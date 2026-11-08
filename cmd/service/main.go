@@ -36,8 +36,12 @@ func run() error {
 		return seed()
 	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		_, port, err := net.SplitHostPort(os.Getenv("HTTP_ADDR"))
+		if err != nil {
+			return fmt.Errorf("HTTP_ADDR: %w", err)
+		}
 		client := http.Client{Timeout: 3 * time.Second}
-		response, err := client.Get("http://127.0.0.1:8080/health/ready")
+		response, err := client.Get("http://127.0.0.1:" + port + "/health/ready")
 		if err != nil {
 			return err
 		}

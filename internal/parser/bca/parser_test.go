@@ -1,7 +1,9 @@
 package bca
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +40,120 @@ func TestReceipts(t *testing.T) {
 		if outcome != "" || r.ReceiptKind != tt.kind || r.Amount != tt.amount || (r.Fee != nil) != tt.fee {
 			t.Fatalf("%+v %s", r, outcome)
 		}
+	}
+}
+
+func TestQRISPayment(t *testing.T) {
+	body := []byte(fixture(t, "qris-payment.html"))
+	r, outcome := ParseWithSubject(body, "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.ParserVersion != "bca-qris-payment-v1" || r.Amount != "30000.00" || r.PaymentTo != "Example Merchant" || r.SourceAccountAlias != "Tahapan - 1234****56" || r.BeneficiaryAccountMasked != "" || r.TransactionDateLocal != "2026-10-02T11:20:40" {
+		t.Fatalf("unexpected QRIS result: %+v %s", r, outcome)
+	}
+	if _, outcome := ParseWithSubject(body, "Other subject"); outcome != "unsupported" {
+		t.Fatalf("wrong subject: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(string(body), "QRIS Payment", "Other Payment", 1)), "Internet Transaction Journal"); outcome != "unsupported" {
+		t.Fatalf("unknown journal layout: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(string(body), "IDR 30,000.00", "IDR bad", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid amount: %s", outcome)
+	}
+}
+
+func TestJournalTransfersUseTransferParser(t *testing.T) {
+	for _, tc := range []struct{ fixture, kind string }{
+		{"account.html", "bca_transfer"},
+		{"interbank.html", "interbank_transfer"},
+	} {
+		got, outcome := ParseWithSubject([]byte(fixture(t, tc.fixture)), "Internet Transaction Journal")
+		if outcome != "" || got.ReceiptKind != tc.kind {
+			t.Fatalf("%s: kind=%s outcome=%s", tc.fixture, got.ReceiptKind, outcome)
+		}
+	}
+}
+
+func TestJournalTopUpAndQRISTransfer(t *testing.T) {
+	for _, tc := range []struct{ fixture, version, amount, payee string }{
+		{"flazz-top-up.html", "bca-flazz-top-up-v1", "50000.00", "Flazz ************3456"},
+		{"qris-transfer.html", "bca-qris-transfer-v1", "42000.00", "Example Recipient"},
+	} {
+		body := []byte(fixture(t, tc.fixture))
+		r, outcome := ParseWithSubject(body, "Internet Transaction Journal")
+		if outcome != "" || r.ReceiptKind != "bca_payment" || r.ParserVersion != tc.version || r.Amount != tc.amount || r.PaymentTo != tc.payee || r.Fee != nil {
+			t.Fatalf("%s: %+v %s", tc.fixture, r, outcome)
+		}
+		if strings.Contains(fmt.Sprintf("%+v", r), "1234567890123456") || strings.Contains(fmt.Sprintf("%+v", r), "123456789012345678") {
+			t.Fatalf("%s: full card/PAN leaked", tc.fixture)
+		}
+		if d := Diagnose(body, "Internet Transaction Journal"); d.ParserOutcome != "supported" || !d.RetryRecommended {
+			t.Fatalf("%s: %+v", tc.fixture, d)
+		}
+	}
+	flazz := fixture(t, "flazz-top-up.html")
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(flazz, "1234567890123456", "not-a-card", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid card: %s", outcome)
+	}
+	transfer := fixture(t, "qris-transfer.html")
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(transfer, "123456789012345678", "invalid-pan", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid PAN: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(transfer, "IDR 42,000.00", "bad amount", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid amount: %s", outcome)
+	}
+}
+
+func TestVirtualAccountPayment(t *testing.T) {
+	body := fixture(t, "virtual-account.html")
+	r, outcome := ParseWithSubject([]byte(body), "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.ParserVersion != "bca-virtual-account-v1" || r.Amount != "50000.00" || r.Fee == nil || *r.Fee != "1000.00" || r.PaymentTo != "EXAMPLE WALLET / TOP UP" {
+		t.Fatalf("unexpected VA receipt: %+v outcome=%s", r, outcome)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", r), "12345678901234567") {
+		t.Fatal("full virtual account number leaked")
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 51,000.00", "IDR 52,000.00", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("mismatched total: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 1,000.00", "invalid", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid explicit fee: %s", outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "12345678901234567", "invalid-account", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("invalid VA: %s", outcome)
+	}
+}
+
+func TestVirtualAccountWithoutAdminFee(t *testing.T) {
+	body := strings.Replace(fixture(t, "virtual-account.html"), "<tr><td>Admin Fee</td><td>IDR 1,000.00</td></tr>\n", "", 1)
+	body = strings.Replace(body, "IDR 51,000.00", "IDR 50,000.00", 1)
+	r, outcome := ParseWithSubject([]byte(body), "Internet Transaction Journal")
+	if outcome != "" || r.ReceiptKind != "bca_payment" || r.Amount != "50000.00" || r.Fee != nil {
+		t.Fatalf("missing fee: %+v outcome=%s", r, outcome)
+	}
+	if _, outcome := ParseWithSubject([]byte(strings.Replace(body, "IDR 50,000.00</td></tr>\n<tr><td>Reference", "IDR 51,000.00</td></tr>\n<tr><td>Reference", 1)), "Internet Transaction Journal"); outcome != "needs_review" {
+		t.Fatalf("missing fee with mismatched total: %s", outcome)
+	}
+	plain := "Status: Successful\nTransaction Date: 06 Oct 2026 08:39:40\nTransfer Type: Transfer to BCA Virtual Account\nSource of Fund: 2180xxxx19\nBCA Virtual Account No.: 3901085177825921\nName: Example Recipient\nCompany/Product Name: EXAMPLE WALLET / TOP UP\nPay Amount: IDR 21,500.00\nTotal Payment: IDR 21,500.00\nReference No.: REF20261006083940"
+	r, outcome = ParseWithSubject([]byte(strings.ReplaceAll(plain, ": ", " \t: \t")), "Internet Transaction Journal")
+	if outcome != "" || r.Amount != "21500.00" || r.Fee != nil || r.TransactionDateLocal != "2026-10-06T08:39:40" {
+		t.Fatalf("plain no-fee receipt: %+v outcome=%s", r, outcome)
+	}
+}
+
+func TestDiagnoseUnsupported(t *testing.T) {
+	body := `<table><tr><td>Status</td><td>Successful</td></tr><tr><td>Transaction Type</td><td>Card Payment</td></tr><tr><td>Total Payment</td><td>IDR 30,000.00</td></tr><tr><td>Payment To</td><td>Private Merchant</td></tr><tr><td>Reference No.</td><td>REF1234</td></tr></table>`
+	d := Diagnose([]byte(body), "Internet Transaction Journal")
+	if d.ParserOutcome != "unsupported" || d.ReasonCode != "parser_unsupported_transaction_type" || d.TransactionType != "Card Payment" || d.Subject != "Internet Transaction Journal" {
+		t.Fatalf("unexpected diagnosis: %+v", d)
+	}
+	encoded := fmt.Sprintf("%+v", d)
+	if strings.Contains(encoded, "30,000") || strings.Contains(encoded, "Private Merchant") || strings.Contains(encoded, "REF1234") {
+		t.Fatalf("financial data leaked in diagnosis: %s", encoded)
+	}
+	if got := Diagnose([]byte(`<table><tr><td>Other</td><td>Value</td></tr></table>`), "Other").ReasonCode; got != "parser_missing_status" {
+		t.Fatalf("missing status reason: %s", got)
+	}
+	if got := Diagnose([]byte(fixture(t, "qris-payment.html")), "Internet Transaction Journal"); got.ParserOutcome != "supported" || got.ReceiptKind != "bca_payment" || !got.RetryRecommended {
+		t.Fatalf("supported diagnosis: %+v", got)
 	}
 }
 
